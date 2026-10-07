@@ -39,6 +39,13 @@
 #define NUM_COL    106          // number of channel status columns
 #define MAX_ACQ    4.0          // max code length for direct acquisition (ms)
 #define MAX_BUFF_USE 90         // max buffer usage rate (%)
+#define LOCK_LAG   100          // lock-step file replay: max CH lag (* SDR_CYC)
+
+#define SRCH_GAP_LS 100         // lock-step: min gap between search starts (* SDR_CYC)
+#define MAX_SRCH_LS 16          // lock-step: max concurrent search CHs
+
+static int lockstep = 0;        // lock-step file replay (-tscale 0): no data skipped
+static int64_t srch_ix = -SRCH_GAP_LS; // lock-step: data index of the last search start
 #define MAX_BAR    12           // C/N0 bar width
 #define SAMPLES_STATS 100       // samples for stats
 #define AGC_LEVEL  2.3          // target std-dev for auto gain control
@@ -545,7 +552,7 @@ static void *ch_thread(void *arg)
             // update observation data
             sdr_pvt_udobs(th->rcv->pvt, th->ix, ch);
         }
-        sdr_sleep_msec(TH_CYC);
+        sdr_sleep_msec(lockstep ? 1 : TH_CYC);
     }
     return NULL;
 }
@@ -1260,8 +1267,19 @@ static void update_srch_ch(sdr_rcv_t *rcv)
     if (rcv->stats.buff_use > MAX_BUFF_USE) { // IF data buffer full ?
         return;
     }
+    if (lockstep) {
+        // Searches paced in data time as in real time (~1 per 100 ms), but
+        // run concurrently: the data clock stops while a CH lags.
+        int64_t ix = get_buff_ix(rcv);
+        int nsrch = 0;
+        if (ix - srch_ix < SRCH_GAP_LS) return;
+        for (int i = 0; i < rcv->nch; i++) {
+            if (rcv->th[i]->ch->state == SDR_STATE_SRCH) nsrch++;
+        }
+        if (nsrch >= MAX_SRCH_LS) return;
+    }
     // signal search channel busy ?
-    if (rcv->ich >= 0 && rcv->th[rcv->ich]->ch->state == SDR_STATE_SRCH) {
+    else if (rcv->ich >= 0 && rcv->th[rcv->ich]->ch->state == SDR_STATE_SRCH) {
         return;
     }
     for (int i = 0; i < rcv->nch; i++) {
@@ -1280,6 +1298,7 @@ static void update_srch_ch(sdr_rcv_t *rcv)
                 if (nw < 3) nw = 3;
                 ch->acq->fd_ext_n = nw;
                 ch->state = SDR_STATE_SRCH;
+                srch_ix = get_buff_ix(rcv);
                 break;
             }
         }
@@ -1287,6 +1306,7 @@ static void update_srch_ch(sdr_rcv_t *rcv)
         if (re_acq(rcv, ch) || assist_acq(rcv, ch) ||
             (ch->T <= sdr_max_acq * 1e-3 && ch->sig_srch)) {
             ch->state = SDR_STATE_SRCH;
+            srch_ix = get_buff_ix(rcv);
             break;
         }
     }
@@ -1322,6 +1342,18 @@ static void *rcv_thread(void *arg)
         }
         sum_size += size;
         
+        // lock-step file replay: wait until every CH is within LOCK_LAG
+        // (searching CHs within half the buffer, so searches run in parallel)
+        while (lockstep && rcv->state) {
+            int wait = 0;
+            for (int i = 0; i < rcv->nch && !wait; i++) {
+                int64_t lag = ix - rcv->th[i]->ix;
+                int srch = rcv->th[i]->ch->state == SDR_STATE_SRCH;
+                wait = lag > (srch ? MAX_BUFF / 2 : LOCK_LAG);
+            }
+            if (!wait) break;
+            sdr_sleep_msec(1);
+        }
         // write IF data buffer
         write_buff(rcv, raw, ix);
         
@@ -1341,7 +1373,7 @@ static void *rcv_thread(void *arg)
             update_scale(rcv);
         }
         // sleep if reading file
-        if (rcv->dev == SDR_DEV_FILE) {
+        if (rcv->dev == SDR_DEV_FILE && !lockstep) {
             sdr_sleep_msec((int)(ix - (sdr_get_tick() - tick) * rcv->tscale));
         }
     }
@@ -1827,6 +1859,7 @@ static sdr_rcv_t *rcv_open_file(const char **sigs, int *prns, int n, int fmt,
     sdr_rcv_t *rcv = sdr_rcv_new(sigs, prns, n, fmt, fs, fo_t, IQ_t, bits_t,
         opt);
     rcv->tscale = tscale;
+    lockstep = tscale <= 0.0;
     if (!sdr_rcv_start(rcv, SDR_DEV_FILE, (void *)fp, types, paths)) {
         fclose(fp);
         sdr_rcv_free(rcv);
