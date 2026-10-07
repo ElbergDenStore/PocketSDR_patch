@@ -286,6 +286,7 @@ typedef struct {                // SDR receiver channel thread type
     int state;                  // state (0:stop,1:run)
     sdr_ch_t *ch;               // SDR receiver channel
     int64_t ix;                 // IF data buffer read pointer (cyc)
+    int64_t srch_ix;            // IF data index of last search start (cyc)
     struct sdr_rcv_tag *rcv;    // pointer to SDR receiver
     sdr_thread_t thread;        // SDR receiver channel thread
 } sdr_ch_th_t;

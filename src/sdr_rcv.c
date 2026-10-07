@@ -41,11 +41,10 @@
 #define MAX_BUFF_USE 90         // max buffer usage rate (%)
 #define LOCK_LAG   100          // lock-step file replay: max CH lag (* SDR_CYC)
 
-#define SRCH_GAP_LS 100         // lock-step: min gap between search starts (* SDR_CYC)
-#define MAX_SRCH_LS 16          // lock-step: max concurrent search CHs
+#define SRCH_CYC_LS 200         // lock-step: search start cycle (* SDR_CYC)
+#define SRCH_LAG_LS (MAX_BUFF / 2) // lock-step: free CH lag after search start (* SDR_CYC)
 
 static int lockstep = 0;        // lock-step file replay (-tscale 0): no data skipped
-static int64_t srch_ix = -SRCH_GAP_LS; // lock-step: data index of the last search start
 #define MAX_BAR    12           // C/N0 bar width
 #define SAMPLES_STATS 100       // samples for stats
 #define AGC_LEVEL  2.3          // target std-dev for auto gain control
@@ -517,6 +516,7 @@ static sdr_ch_th_t *ch_th_new(const char *sig, int prn, double fi, double fs,
         sdr_free(th);
         return NULL;
     }
+    th->srch_ix = -SRCH_LAG_LS;
     th->rcv = rcv;
     return th;
 }
@@ -974,6 +974,12 @@ static void write_buff(sdr_rcv_t *rcv, const uint8_t *raw, int64_t ix)
 }
 #undef WR_CH
 
+// lock-step: test if CH may still lag after a recent search start -----------
+static int srch_lag(const sdr_ch_th_t *th, int64_t ix)
+{
+    return lockstep && th->srch_ix + SRCH_LAG_LS > ix;
+}
+
 // re-acquisition --------------------------------------------------------------
 static int re_acq(sdr_rcv_t *rcv, sdr_ch_t *ch)
 {
@@ -991,10 +997,13 @@ static int re_acq(sdr_rcv_t *rcv, sdr_ch_t *ch)
 // assisted acquisition --------------------------------------------------------
 static int assist_acq(sdr_rcv_t *rcv, sdr_ch_t *ch)
 {
+    int64_t ix = get_buff_ix(rcv);
     for (int i = 0; i < rcv->nch; i++) {
         sdr_ch_t *ch_i = rcv->th[i]->ch;
         if (strcmp(ch->sat, ch_i->sat) || ch_i->state != SDR_STATE_LOCK ||
-            ch_i->lock * ch_i->T < MIN_LOCK) continue;
+            ch_i->lock * ch_i->T < MIN_LOCK || srch_lag(rcv->th[i], ix)) {
+            continue;
+        }
         ch->acq->fd_ext = (float)(ch_i->fd * ch->fc / ch_i->fc);
         ch->acq->fd_ext_valid = 1;
         return 1;
@@ -1261,32 +1270,15 @@ static void update_buff_use(sdr_rcv_t *rcv)
     }
 }
 
-// update signal search channel ------------------------------------------------
-static void update_srch_ch(sdr_rcv_t *rcv)
+// start signal search in next IDLE channel: return 1=started, 0=none ----------
+static int start_srch_ch(sdr_rcv_t *rcv, int64_t ix)
 {
-    if (rcv->stats.buff_use > MAX_BUFF_USE) { // IF data buffer full ?
-        return;
-    }
-    if (lockstep) {
-        // Searches paced in data time as in real time (~1 per 100 ms), but
-        // run concurrently: the data clock stops while a CH lags.
-        int64_t ix = get_buff_ix(rcv);
-        int nsrch = 0;
-        if (ix - srch_ix < SRCH_GAP_LS) return;
-        for (int i = 0; i < rcv->nch; i++) {
-            if (rcv->th[i]->ch->state == SDR_STATE_SRCH) nsrch++;
-        }
-        if (nsrch >= MAX_SRCH_LS) return;
-    }
-    // signal search channel busy ?
-    else if (rcv->ich >= 0 && rcv->th[rcv->ich]->ch->state == SDR_STATE_SRCH) {
-        return;
-    }
     for (int i = 0; i < rcv->nch; i++) {
         // search next IDLE channel
         rcv->ich = (rcv->ich + 1) % rcv->nch;
-        sdr_ch_t *ch = rcv->th[rcv->ich]->ch;
-        if (ch->state != SDR_STATE_IDLE) continue;
+        sdr_ch_th_t *th = rcv->th[rcv->ich];
+        sdr_ch_t *ch = th->ch;
+        if (ch->state != SDR_STATE_IDLE || srch_lag(th, ix)) continue;
         
         // fast acquisition: skip invisible satellites, aid visible ones
         if (rcv->fast_acq) {
@@ -1298,18 +1290,53 @@ static void update_srch_ch(sdr_rcv_t *rcv)
                 if (nw < 3) nw = 3;
                 ch->acq->fd_ext_n = nw;
                 ch->state = SDR_STATE_SRCH;
-                srch_ix = get_buff_ix(rcv);
-                break;
+                th->srch_ix = ix;
+                return 1;
             }
         }
         // re-acquisition, assisted-acquisition or short code cycle
         if (re_acq(rcv, ch) || assist_acq(rcv, ch) ||
             (ch->T <= sdr_max_acq * 1e-3 && ch->sig_srch)) {
             ch->state = SDR_STATE_SRCH;
-            srch_ix = get_buff_ix(rcv);
-            break;
+            th->srch_ix = ix;
+            return 1;
         }
     }
+    return 0;
+}
+
+// update signal search channel ------------------------------------------------
+static void update_srch_ch(sdr_rcv_t *rcv)
+{
+    if (rcv->stats.buff_use > MAX_BUFF_USE) { // IF data buffer full ?
+        return;
+    }
+    // signal search channel busy ?
+    if (rcv->ich >= 0 && rcv->th[rcv->ich]->ch->state == SDR_STATE_SRCH) {
+        return;
+    }
+    start_srch_ch(rcv, get_buff_ix(rcv));
+}
+
+// lock-step: wait for CHs within LOCK_LAG of ix (sync: all data up to ix) ----
+static void wait_ch_lag(sdr_rcv_t *rcv, int64_t ix, int sync)
+{
+    for (int i = 0; i < rcv->nch && rcv->state; ) {
+        sdr_ch_th_t *th = rcv->th[i];
+        int n = th->ch->N / rcv->N;
+        int max_lag = th->ch->state == SDR_STATE_SRCH ? MAX_BUFF / 2 : LOCK_LAG;
+        int wait = sync ? th->ix + 2 * n <= ix && !srch_lag(th, ix) :
+            ix - th->ix > max_lag;
+        if (wait) sdr_sleep_msec(1); else i++;
+    }
+}
+
+// lock-step: start search on synced CHs, so data alone decides it -----------
+static void update_srch_ch_ls(sdr_rcv_t *rcv, int64_t ix)
+{
+    if (ix % SRCH_CYC_LS) return;
+    wait_ch_lag(rcv, ix, 1);
+    start_srch_ch(rcv, ix);
 }
 
 // SDR receiver thread ---------------------------------------------------------
@@ -1342,17 +1369,9 @@ static void *rcv_thread(void *arg)
         }
         sum_size += size;
         
-        // lock-step file replay: wait until every CH is within LOCK_LAG
-        // (searching CHs within half the buffer, so searches run in parallel)
-        while (lockstep && rcv->state) {
-            int wait = 0;
-            for (int i = 0; i < rcv->nch && !wait; i++) {
-                int64_t lag = ix - rcv->th[i]->ix;
-                int srch = rcv->th[i]->ch->state == SDR_STATE_SRCH;
-                wait = lag > (srch ? MAX_BUFF / 2 : LOCK_LAG);
-            }
-            if (!wait) break;
-            sdr_sleep_msec(1);
+        // lock-step file replay: wait for lagging CHs
+        if (lockstep) {
+            wait_ch_lag(rcv, ix, 0);
         }
         // write IF data buffer
         write_buff(rcv, raw, ix);
@@ -1362,7 +1381,11 @@ static void *rcv_thread(void *arg)
             1e-6;
         
         // update signal search channel
-        update_srch_ch(rcv);
+        if (lockstep) {
+            update_srch_ch_ls(rcv, ix);
+        } else {
+            update_srch_ch(rcv);
+        }
         
         // update PVT solution
         sdr_pvt_udsol(rcv->pvt, ix);
