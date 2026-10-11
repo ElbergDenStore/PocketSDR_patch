@@ -56,7 +56,7 @@ static const char *usage_text[] = {
     "       [-toff toff] [-ti tint] [-p bus,[,port] [-c conf_file]",
     "       [-driver name] [-gain gain] [-bw bw] [-fd dopp]",
     "       [-log path] [-nmea path] [-rtcm path] [-raw path] ... [-opt file]",
-    "       [-arch nch] [-geom file] [-fast] [file]",
+    "       [-arch nch] [-geom file] [-fast] [-trace path] [file]",
     NULL
 };
 
@@ -214,6 +214,7 @@ int main(int argc, char **argv)
     double gain = 0.0, bw = 0.0, max_dop = 0.0;
     char rfch_opt[1024] = "-RFCH";
     const char *geom_file = "";
+    const char *trace_path = NULL;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-sig") && i + 1 < argc) {
@@ -233,6 +234,8 @@ int main(int argc, char **argv)
             toff = atof(argv[++i]);
         } else if (!strcmp(argv[i], "-tscale") && i + 1 < argc) {
             tscale = atof(argv[++i]);
+        } else if (!strcmp(argv[i], "-trace") && i + 1 < argc) {
+            trace_path = argv[++i];
         } else if (!strcmp(argv[i], "-fmt") && i + 1 < argc) {
             const char *str = argv[++i];
             if      (!strcmp(str, "INT8"  )) fmt = SDR_FMT_INT8;
@@ -304,6 +307,9 @@ int main(int argc, char **argv)
             file = argv[i];
         }
     }
+    if (trace_path && !sdr_trace_open(trace_path)) {
+        fprintf(stderr, "trace marker open error: %s\n", trace_path);
+    }
     if (*debug_file) {
         traceopen(debug_file);
         tracelevel(TRACE_LEVEL);
@@ -370,6 +376,7 @@ int main(int argc, char **argv)
         printf("%s", ESC_VCUR);
     }
     sdr_rcv_close(rcv);
+    sdr_trace_close();
     
     if (*debug_file) {
         traceclose();

@@ -132,10 +132,12 @@ typedef struct sdr_web_tag sdr_web_t; // Web UI server type
 #ifdef WIN32
 typedef HANDLE sdr_thread_t;     // thread type
 typedef SRWLOCK sdr_mutex_t;     // mutex type
+typedef CONDITION_VARIABLE sdr_cond_t; // condition variable type
 #define SDR_MUTEX_INIT SRWLOCK_INIT // mutex initializer
 #else
 typedef pthread_t sdr_thread_t;
 typedef pthread_mutex_t sdr_mutex_t;
+typedef pthread_cond_t sdr_cond_t;
 #define SDR_MUTEX_INIT PTHREAD_MUTEX_INITIALIZER
 #endif
 
@@ -287,6 +289,7 @@ typedef struct {                // SDR receiver channel thread type
     sdr_ch_t *ch;               // SDR receiver channel
     int64_t ix;                 // IF data buffer read pointer (cyc)
     int64_t srch_ix;            // IF data index of last search start (cyc)
+    int trace_state;            // CH state of open trace slice (0: none)
     struct sdr_rcv_tag *rcv;    // pointer to SDR receiver
     sdr_thread_t thread;        // SDR receiver channel thread
 } sdr_ch_th_t;
@@ -400,6 +403,8 @@ typedef struct sdr_rcv_tag {    // SDR receiver type
     int64_t srch_credit;        // lock-step search budget credit (Mflop)
     sdr_thread_t thread;        // SDR receiver thread
     sdr_mutex_t mtx;            // lock flag
+    sdr_cond_t data_cond;       // lock-step: new IF data (with mtx)
+    sdr_cond_t ch_cond;         // lock-step: CH progress (with mtx)
 } sdr_rcv_t;
 
 // function prototypes -------------------------------------------------------
@@ -417,6 +422,15 @@ void sdr_thread_join(sdr_thread_t thread);
 void sdr_mutex_init(sdr_mutex_t *mtx);
 void sdr_mutex_lock(sdr_mutex_t *mtx);
 void sdr_mutex_unlock(sdr_mutex_t *mtx);
+void sdr_cond_init(sdr_cond_t *cond);
+int sdr_cond_wait(sdr_cond_t *cond, sdr_mutex_t *mtx, int msec);
+void sdr_cond_broadcast(sdr_cond_t *cond);
+void sdr_thread_name(const char *name);
+int sdr_trace_open(const char *path);
+void sdr_trace_close(void);
+int sdr_trace_on(void);
+void sdr_trace_begin(const char *name);
+void sdr_trace_end(void);
 
 // sdr_usb.c
 sdr_usb_t *sdr_usb_open(int bus, int port, const uint16_t *vid,

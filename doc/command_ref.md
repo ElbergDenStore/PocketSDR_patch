@@ -307,7 +307,7 @@ pocket_trk [-sig sig -prn prn[,...] [-rfch ch[,...]] ...]
            [-p bus[,port]] [-c conf_file]
            [-driver name] [-gain gain] [-bw bw] [-fd dopp]
            [-log path] [-nmea path] [-rtcm path] [-raw path] ...
-           [-arch nch] [-geom file] [-fast]
+           [-arch nch] [-geom file] [-fast] [-trace path]
            [-h height] [-opt file] [-debug file] [-v] [file]
 ```
 
@@ -374,6 +374,11 @@ The input can be a local file, a TCP stream, a Pocket SDR FE device, or a SoapyS
   - Fast acquisition after the first fix: skip satellites below the horizon and search +-500 Hz around
     the Doppler predicted from the ephemeris or almanac, the fix and its clock drift. The time is the
     IF data's, from the last fix. [off]
+- `-trace path`
+  - Linux ftrace trace marker (`/sys/kernel/tracing/trace_marker`, `""` for
+    that path) for slices in a system trace (Perfetto): each CH thread's
+    `search`, `assisted search` and `track`, and the receiver thread's waits
+    for input and for CHs. Threads are named `rcv` and `<sig> <sat>`. [none]
 - `-h height`
   - Console height (rows) for the runtime status display. [`64`]
 - `-opt file`

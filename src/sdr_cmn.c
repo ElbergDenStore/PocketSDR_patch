@@ -12,7 +12,13 @@
 //                   move API sdr_cpx_malloc(), sdr_cpx_free() to sdr_func.c
 //  2026-02-12  1.3  add API sdr_thread_create(), sdr_thread_join(),
 //                   sdr_mutex_init(), sdr_mutex_lock(), sdr_mutex_unlock()
+//  2026-10-11  1.4  add API sdr_cond_init(), sdr_cond_wait(),
+//                   sdr_cond_broadcast(), sdr_thread_name(), sdr_trace_open(),
+//                   sdr_trace_close(), sdr_trace_begin(), sdr_trace_end()
 //
+#ifndef WIN32
+#define _GNU_SOURCE // pthread_setname_np()
+#endif
 #include "pocket_sdr.h"
 #ifdef WIN32
 #include <timeapi.h>
@@ -20,11 +26,16 @@
 #else
 #include <time.h>
 #include <sys/time.h>
+#include <fcntl.h>
+#include <unistd.h>
 #endif
+
+#define TRACE_MARKER "/sys/kernel/tracing/trace_marker" // ftrace marker
 
 // global variables ------------------------------------------------------------
 static const char *lib_name = SDR_LIB_NAME;
 static const char *lib_ver = SDR_LIB_VER;
+static int trace_fd = -1;       // trace marker file descriptor (-1: off)
 
 //------------------------------------------------------------------------------
 //  Allocate memory. memory is zero-cleared. If no memory allocated, it exits
@@ -281,5 +292,178 @@ void sdr_mutex_unlock(sdr_mutex_t *mtx)
     if (mtx) ReleaseSRWLockExclusive(mtx);
 #else
     (void)pthread_mutex_unlock(mtx);
+#endif
+}
+
+//------------------------------------------------------------------------------
+//  Initialize condition variable.
+//
+//  args:
+//      cond     (IO) condition variable
+//
+//  return:
+//      none
+//
+void sdr_cond_init(sdr_cond_t *cond)
+{
+#ifdef WIN32
+    InitializeConditionVariable(cond);
+#else
+    (void)pthread_cond_init(cond, NULL);
+#endif
+}
+
+//------------------------------------------------------------------------------
+//  Wait for condition variable with locked mutex, at most msec ms.
+//
+//  args:
+//      cond     (IO) condition variable
+//      mtx      (IO) mutex (locked by caller)
+//      msec     (I)  timeout (ms)
+//
+//  return:
+//      status (1:signaled or spurious wake-up, 0:timeout)
+//
+int sdr_cond_wait(sdr_cond_t *cond, sdr_mutex_t *mtx, int msec)
+{
+#ifdef WIN32
+    return SleepConditionVariableSRW(cond, mtx, (DWORD)msec, 0) ? 1 : 0;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += msec / 1000;
+    ts.tv_nsec += (long)(msec % 1000) * 1000000;
+    if (ts.tv_nsec >= 1000000000) {
+        ts.tv_sec++;
+        ts.tv_nsec -= 1000000000;
+    }
+    return pthread_cond_timedwait(cond, mtx, &ts) == 0;
+#endif
+}
+
+//------------------------------------------------------------------------------
+//  Wake up all threads waiting for condition variable.
+//
+//  args:
+//      cond     (IO) condition variable
+//
+//  return:
+//      none
+//
+void sdr_cond_broadcast(sdr_cond_t *cond)
+{
+#ifdef WIN32
+    WakeAllConditionVariable(cond);
+#else
+    (void)pthread_cond_broadcast(cond);
+#endif
+}
+
+//------------------------------------------------------------------------------
+//  Name calling thread (shown by ps, top and system traces, max 15 chars).
+//
+//  args:
+//      name     (I)  thread name
+//
+//  return:
+//      none
+//
+void sdr_thread_name(const char *name)
+{
+#ifndef WIN32
+    char buff[16];
+    snprintf(buff, sizeof(buff), "%s", name);
+    (void)pthread_setname_np(pthread_self(), buff);
+#endif
+}
+
+//------------------------------------------------------------------------------
+//  Open ftrace trace marker for slices in system traces (Perfetto, atrace
+//  format).
+//
+//  args:
+//      path     (I)  trace marker path ("": /sys/kernel/tracing/trace_marker)
+//
+//  return:
+//      status (1:OK,0:error)
+//
+int sdr_trace_open(const char *path)
+{
+#ifdef WIN32
+    return 0;
+#else
+    sdr_trace_close();
+    trace_fd = open(*path ? path : TRACE_MARKER, O_WRONLY | O_APPEND);
+    return trace_fd >= 0;
+#endif
+}
+
+//------------------------------------------------------------------------------
+//  Close trace marker.
+//
+//  args:
+//      none
+//
+//  return:
+//      none
+//
+void sdr_trace_close(void)
+{
+#ifndef WIN32
+    if (trace_fd >= 0) close(trace_fd);
+    trace_fd = -1;
+#endif
+}
+
+//------------------------------------------------------------------------------
+//  Test if trace marker is open.
+//
+//  args:
+//      none
+//
+//  return:
+//      status (1:open,0:closed)
+//
+int sdr_trace_on(void)
+{
+    return trace_fd >= 0;
+}
+
+// write trace marker record ---------------------------------------------------
+static void trace_write(const char *buff, int n, int size)
+{
+#ifndef WIN32
+    if (n >= size) n = size - 1; // truncated
+    if (n > 0 && write(trace_fd, buff, (size_t)n) < 0) {
+        sdr_trace_close(); // e.g. tracing stopped: no more records
+    }
+#endif
+}
+
+//------------------------------------------------------------------------------
+//  Begin and end slice on calling thread (no-op if trace marker not open).
+//
+//  args:
+//      name     (I)  slice name
+//
+//  return:
+//      none
+//
+void sdr_trace_begin(const char *name)
+{
+#ifndef WIN32
+    char buff[128];
+    if (trace_fd < 0) return;
+    trace_write(buff, snprintf(buff, sizeof(buff), "B|0|%s\n", name),
+        sizeof(buff)); // tgid 0: the kernel's own (getpid() differs in PID ns)
+#endif
+}
+
+void sdr_trace_end(void)
+{
+#ifndef WIN32
+    char buff[32];
+    if (trace_fd < 0) return;
+    trace_write(buff, snprintf(buff, sizeof(buff), "E|0\n"), sizeof(buff));
 #endif
 }

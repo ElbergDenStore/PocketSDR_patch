@@ -27,6 +27,9 @@
 //  2026-08-08  1.13 report an output stream open error as stream status error
 //
 #include "pocket_sdr.h"
+#ifndef WIN32
+#include <poll.h>
+#endif
 
 // constants and macros ---------------------------------------------------------
 #define MAX_BUFF   8000         // max number of IF data buffer (* SDR_CYC)
@@ -43,6 +46,8 @@
 
 #define SRCH_CYC_LS 200         // lock-step: search start cycle (* SDR_CYC)
 #define SRCH_LAG_LS (MAX_BUFF / 2) // lock-step: free CH lag after search start (* SDR_CYC)
+#define WAKE_CYC_LS 50          // lock-step: CH wake-up cycle (* SDR_CYC)
+#define WAIT_LS    100          // lock-step: max wait for a wake-up (ms)
 
 static int lockstep = 0;        // lock-step file replay (-tscale 0): no data skipped
 #define MAX_BAR    12           // C/N0 bar width
@@ -530,20 +535,57 @@ static void ch_th_free(sdr_ch_th_t *th)
     sdr_free(th);
 }
 
+// trace CH state changes as slices (search, track) ---------------------------
+static void trace_ch_state(sdr_ch_th_t *th)
+{
+    int state = th->state ? th->ch->state : SDR_STATE_IDLE;
+    
+    if (state == th->trace_state) return;
+    if (th->trace_state == SDR_STATE_SRCH || th->trace_state == SDR_STATE_LOCK) {
+        sdr_trace_end();
+    }
+    if (state == SDR_STATE_SRCH) {
+        sdr_trace_begin(th->ch->acq->fd_ext_valid ? "assisted search" :
+            "search");
+    } else if (state == SDR_STATE_LOCK) {
+        sdr_trace_begin("track");
+    }
+    th->trace_state = state;
+}
+
+// lock-step: report CH progress, then wait for new IF data --------------------
+static void wait_data_ls(sdr_ch_th_t *th, int n)
+{
+    sdr_rcv_t *rcv = th->rcv;
+    
+    sdr_mutex_lock(&rcv->mtx);
+    sdr_cond_broadcast(&rcv->ch_cond);
+    while (th->state && th->ix + 2 * n > rcv->ix) {
+        if (!sdr_cond_wait(&rcv->data_cond, &rcv->mtx, WAIT_LS)) break;
+    }
+    sdr_mutex_unlock(&rcv->mtx);
+}
+
 // SDR receiver CH thread ------------------------------------------------------
 static void *ch_thread(void *arg)
 {
     sdr_ch_th_t *th = (sdr_ch_th_t *)arg;
     sdr_ch_t *ch = th->ch;
     int n = ch->N / th->rcv->N;
+    char name[32];
+    
+    sdr_sat_id(ch->sig, ch->prn, name + snprintf(name, 16, "%s ", ch->sig));
+    sdr_thread_name(name);
     
     while (th->state) {
         int64_t ix = get_buff_ix(th->rcv);
         for ( ; th->ix + 2 * n <= ix && th->state; th->ix += n) {
             
             // update SDR receiver CH
+            trace_ch_state(th);
             sdr_ch_update(ch, th->ix * SDR_CYC, th->rcv->buff[ch->rf_ch],
                 th->rcv->N * (int)(th->ix % MAX_BUFF));
+            trace_ch_state(th);
             
             // update navigation data
             if (ch->nav->stat) {
@@ -553,8 +595,13 @@ static void *ch_thread(void *arg)
             // update observation data
             sdr_pvt_udobs(th->rcv->pvt, th->ix, ch);
         }
-        sdr_sleep_msec(lockstep ? 1 : TH_CYC);
+        if (lockstep) {
+            wait_data_ls(th, n);
+        } else {
+            sdr_sleep_msec(TH_CYC);
+        }
     }
+    trace_ch_state(th);
     return NULL;
 }
 
@@ -570,6 +617,9 @@ static int ch_th_start(sdr_ch_th_t *th)
 static void ch_th_stop(sdr_ch_th_t *th)
 {
     th->state = 0;
+    sdr_mutex_lock(&th->rcv->mtx);
+    sdr_cond_broadcast(&th->rcv->data_cond);
+    sdr_mutex_unlock(&th->rcv->mtx);
 }
 
 // set LPF (option: -LPF=<rfch>:<MHz>[,<rfch>:<MHz> ...]) ----------------------
@@ -739,6 +789,8 @@ sdr_rcv_t *sdr_rcv_new(const char **sigs, const int *prns, int n, int fmt,
     rcv->ich = rcv->ich_rr = -1;
     snprintf(rcv->opt, sizeof(rcv->opt), "%s", opt);
     sdr_mutex_init(&rcv->mtx);
+    sdr_cond_init(&rcv->data_cond);
+    sdr_cond_init(&rcv->ch_cond);
 
     rcv->narch = narch;
     if (rcv->nrfch >= 2) {
@@ -786,7 +838,17 @@ void sdr_rcv_free(sdr_rcv_t *rcv)
 static int read_data(sdr_rcv_t *rcv, uint8_t *raw, int N)
 {
     if (rcv->dev == SDR_DEV_FILE) { // file input
-        if (fread(raw, N, 1, (FILE *)rcv->dp) < 1) {
+        FILE *fp = (FILE *)rcv->dp;
+#ifdef WIN32
+        int wait = 0;
+#else
+        struct pollfd pfd = {fileno(fp), POLLIN, 0};
+        int wait = sdr_trace_on() && poll(&pfd, 1, 0) == 0; // empty pipe
+#endif
+        if (wait) sdr_trace_begin("wait for input");
+        size_t nr = fread(raw, N, 1, fp);
+        if (wait) sdr_trace_end();
+        if (nr < 1) {
             return 0; // end of file
         }
     } else if (rcv->dev == SDR_DEV_USB) { // Pocket SDR FE
@@ -1368,17 +1430,39 @@ static void update_srch_ch(sdr_rcv_t *rcv)
     start_srch_ch(rcv, get_buff_ix(rcv));
 }
 
+// lock-step: wake up CHs waiting for IF data ---------------------------------
+static void wake_ch_ls(sdr_rcv_t *rcv)
+{
+    sdr_mutex_lock(&rcv->mtx);
+    sdr_cond_broadcast(&rcv->data_cond);
+    sdr_mutex_unlock(&rcv->mtx);
+}
+
 // lock-step: wait for CHs within LOCK_LAG of ix (sync: all data up to ix) ----
 static void wait_ch_lag(sdr_rcv_t *rcv, int64_t ix, int sync)
 {
+    int waited = 0;
+    
+    sdr_mutex_lock(&rcv->mtx);
     for (int i = 0; i < rcv->nch && rcv->state; ) {
         sdr_ch_th_t *th = rcv->th[i];
         int n = th->ch->N / rcv->N;
         int max_lag = th->ch->state == SDR_STATE_SRCH ? MAX_BUFF / 2 : LOCK_LAG;
         int wait = sync ? th->ix + 2 * n <= ix && !srch_lag(th, ix) :
             ix - th->ix > max_lag;
-        if (wait) sdr_sleep_msec(1); else i++;
+        if (!wait) {
+            i++;
+            continue;
+        }
+        if (!waited) {
+            waited = 1;
+            sdr_trace_begin(sync ? "sync for search" : "wait for channels");
+            sdr_cond_broadcast(&rcv->data_cond);
+        }
+        sdr_cond_wait(&rcv->ch_cond, &rcv->mtx, WAIT_LS);
     }
+    sdr_mutex_unlock(&rcv->mtx);
+    if (waited) sdr_trace_end();
 }
 
 // lock-step: start search on synced CHs, so data alone decides it. With a
@@ -1410,6 +1494,7 @@ static void *rcv_thread(void *arg)
         sdr_sdev_start((sdr_sdev_t *)rcv->dp);
     }
     rcv->stats.sum = 0.0;
+    sdr_thread_name("rcv");
     
     for (int64_t ix = 0; rcv->state; ix++) {
         if (ix % LOG_CYC == 0) {
@@ -1420,6 +1505,7 @@ static void *rcv_thread(void *arg)
         }
         // read raw IF data
         if (!(size = read_data(rcv, raw, ns * rcv->N))) {
+            if (lockstep) wake_ch_ls(rcv); // let CHs use the last data
             sdr_sleep_msec(500);
             rcv->state = 0;
             continue;
@@ -1432,6 +1518,9 @@ static void *rcv_thread(void *arg)
         }
         // write IF data buffer
         write_buff(rcv, raw, ix);
+        if (lockstep && ix % WAKE_CYC_LS == 0) {
+            wake_ch_ls(rcv);
+        }
         
         // write IF data log streams
         rcv->stats.sum += sdr_rcv_write_str(rcv, SDR_STR_IFDATA, raw, size) *
