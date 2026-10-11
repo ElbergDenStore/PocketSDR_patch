@@ -309,6 +309,7 @@ typedef struct {                // SDR PVT type
     double last_dtr;            // last fix clock bias (s)
     double last_dtrd;           // last fix clock drift rate (s/s)
     int last_valid;             // last fix valid flag
+    int64_t last_ix;            // last fix epoch cycle (cyc, 0: unknown)
 } sdr_pvt_t;
 
 typedef struct {                // SDR RF channel type
@@ -381,6 +382,7 @@ typedef struct sdr_rcv_tag {    // SDR receiver type
     int nch, nrfch;             // number of BB and RF channels
     int narch;                  // number of array channels
     int ich;                    // signal search channel index
+    int ich_rr;                 // last search without Doppler (round robin)
     int64_t ix;                 // IF data cycle count (cyc)
     sdr_rfch_t rfch[SDR_MAX_RFCH]; // RF channels (array CHs derive from rfch[0])
     sdr_arch_t arch[SDR_MAX_ARCH]; // per-array-CH beam state (relative index)
@@ -395,6 +397,7 @@ typedef struct sdr_rcv_tag {    // SDR receiver type
     double tscale;              // time scale to replay IF data file
     char opt[1024];             // receiver options
     int fast_acq;               // fast acquisition flag (0:off, 1:on)
+    int64_t srch_credit;        // lock-step search budget credit (Mflop)
     sdr_thread_t thread;        // SDR receiver thread
     sdr_mutex_t mtx;            // lock flag
 } sdr_rcv_t;

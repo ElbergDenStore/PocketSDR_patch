@@ -56,7 +56,7 @@ static const char *usage_text[] = {
     "       [-toff toff] [-ti tint] [-p bus,[,port] [-c conf_file]",
     "       [-driver name] [-gain gain] [-bw bw] [-fd dopp]",
     "       [-log path] [-nmea path] [-rtcm path] [-raw path] ... [-opt file]",
-    "       [-arch nch] [-geom file] [file]",
+    "       [-arch nch] [-geom file] [-fast] [file]",
     NULL
 };
 
@@ -291,6 +291,9 @@ int main(int argc, char **argv)
             size_t len = strlen(rfch_opt);
             snprintf(rfch_opt + len, sizeof(rfch_opt) - len, " -ARCH=%d",
                 atoi(argv[++i]));
+        } else if (!strcmp(argv[i], "-fast")) {
+            size_t len = strlen(rfch_opt);
+            snprintf(rfch_opt + len, sizeof(rfch_opt) - len, " -FAST_SRCH");
         } else if (!strcmp(argv[i], "-geom") && i + 1 < argc) {
             geom_file = argv[++i];
         } else if (!strcmp(argv[i], "-v")) {

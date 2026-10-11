@@ -1115,6 +1115,7 @@ static void update_sol(sdr_pvt_t *pvt)
         pvt->last_dtr   = pvt->sol->dtr[0];
         pvt->last_dtrd  = pvt->sol->dtr[5];   // clock drift rate (s/s)
         pvt->last_valid = 1;
+        pvt->last_ix    = pvt->ix;
         
         // output log $POS and NMEA RMC, GGA, GSA and GSV
         out_log_pos(time, pvt->sol, pvt->obs->n);
@@ -1220,9 +1221,13 @@ static void res_obs_consist(double time, obs_t *obs)
 //
 void sdr_pvt_udsol(sdr_pvt_t *pvt, int64_t ix)
 {
+    // lock-step file replay: close the epoch at a cycle set by the data alone,
+    // not when the last CH thread happens to report
+    int lockstep = pvt->rcv->dev == SDR_DEV_FILE && pvt->rcv->tscale <= 0.0;
+    
     sdr_mutex_lock(&pvt->mtx);
     
-    if (pvt->ix > 0 && (pvt->nch >= pvt->rcv->nch ||
+    if (pvt->ix > 0 && ((!lockstep && pvt->nch >= pvt->rcv->nch) ||
         ix >= pvt->ix + (int)(sdr_lag_epoch / SDR_CYC))) {
         
         // resolve msec ambiguity in pseudorange (1 ms primary code period)

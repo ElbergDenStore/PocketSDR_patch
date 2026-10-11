@@ -307,7 +307,7 @@ pocket_trk [-sig sig -prn prn[,...] [-rfch ch[,...]] ...]
            [-p bus[,port]] [-c conf_file]
            [-driver name] [-gain gain] [-bw bw] [-fd dopp]
            [-log path] [-nmea path] [-rtcm path] [-raw path] ...
-           [-arch nch] [-geom file]
+           [-arch nch] [-geom file] [-fast]
            [-h height] [-opt file] [-debug file] [-v] [file]
 ```
 
@@ -337,7 +337,8 @@ The input can be a local file, a TCP stream, a Pocket SDR FE device, or a SoapyS
 - `-toff toff`
   - Time offset from the start of the IF data in s. [`0.0`]
 - `-tscale scale`
-  - Replay time scale for file inputs. [`1.0`]
+  - Replay time scale for file inputs. `0` = lock-step replay: as fast as the CPU allows, no data skipped,
+    and search starts decided by the data alone, so the same file gives the same result. [`1.0`]
 - `-ti tint`
   - Update interval of the runtime tracking status in s. `0` suppresses the status display. [`0.1`]
 - `-p bus[,port]`
@@ -369,6 +370,10 @@ The input can be a local file, a TCP stream, a Pocket SDR FE device, or a SoapyS
 - `-geom file`
   - Array element positions file (body-frame, `pocket_sdr.py` array
     geometry format) applied at startup. [none]
+- `-fast`
+  - Fast acquisition after the first fix: skip satellites below the horizon and search +-500 Hz around
+    the Doppler predicted from the ephemeris or almanac, the fix and its clock drift. The time is the
+    IF data's, from the last fix. [off]
 - `-h height`
   - Console height (rows) for the runtime status display. [`64`]
 - `-opt file`
@@ -410,6 +415,7 @@ values are shown in the last column.
 | `lost_th` | Consecutive bad 0.5 s windows before loss | `4` | `4` |
 | `bump_jump` | Enable BOC bump-jump (`0`/`1`) | `0` | `1` |
 | `max_acq` | Longest code period for unassisted scheduling (ms) | `4.0` | `4.0` |
+| `srch_budget` | Lock-step search budget (Gflop per s of IF data, `0`: one start per 0.2 s) | `0` | `0` |
 
 Assisted acquisition uses the larger of `thres_cn0_ext` and the applicable
 tracking-loss threshold plus 1 dB. L6 tracking uses an internal `32.5 dB-Hz`
@@ -419,6 +425,13 @@ updates if synchronization is lost or `b_pll * K * T >= 0.4`, where
 `K = max(1, round(t_coh / T))`.
 
 All numeric keys other than `fftw_wisdom` are passed to `sdr_rcv_setopt()`.
+
+A data signal with a pilot on the same satellite and carrier in the receiver (E1B with E1C,
+B1CD with B1CP, ...) is searched only with a known Doppler: from its pilot once that is locked
+(assisted acquisition) or its own (re-acquisition). These searches go before the searches without
+a Doppler. With `-tscale 0` and `srch_budget` > 0, each search start spends its nominal work,
+2 FFTs of 2N points per Doppler bin and integration at 5 M log2(M) flop, and the next start waits
+until the budget has refilled the credit; the schedule depends on the data only.
 
 
 <div class="pagebreak"></div>
