@@ -421,6 +421,8 @@ values are shown in the last column.
 | `bump_jump` | Enable BOC bump-jump (`0`/`1`) | `0` | `1` |
 | `max_acq` | Longest code period for unassisted scheduling (ms) | `4.0` | `4.0` |
 | `srch_budget` | Lock-step search budget (Gflop per s of IF data, `0`: one start per 0.2 s) | `0` | `0` |
+| `srch_budget_cold` | Search budget while fewer than `srch_nsat` satellites are locked (`0`: `srch_budget`) | `0` | `0` |
+| `srch_nsat` | Satellites locked for `srch_budget` instead of `srch_budget_cold` | `5` | `5` |
 
 Assisted acquisition uses the larger of `thres_cn0_ext` and the applicable
 tracking-loss threshold plus 1 dB. L6 tracking uses an internal `32.5 dB-Hz`
@@ -436,7 +438,11 @@ B1CD with B1CP, ...) is searched only with a known Doppler: from its pilot once 
 (assisted acquisition) or its own (re-acquisition). These searches go before the searches without
 a Doppler. With `-tscale 0` and `srch_budget` > 0, each search start spends its nominal work,
 2 FFTs of 2N points per Doppler bin and integration at 5 M log2(M) flop, and the next start waits
-until the budget has refilled the credit; the schedule depends on the data only.
+until the budget has refilled the credit; the schedule depends on the data only. With
+`srch_budget_cold` > 0 the budget is that while fewer than `srch_nsat` satellites have a locked
+signal, counted when the channels are synchronized for a search, and `srch_budget` otherwise, so
+a cold start searches fast and a receiver with a fix searches little; a `$LOG` record
+`SEARCH BUDGET COLD` or `STEADY` marks each switch.
 
 
 <div class="pagebreak"></div>

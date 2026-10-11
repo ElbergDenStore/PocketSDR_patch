@@ -401,6 +401,8 @@ typedef struct sdr_rcv_tag {    // SDR receiver type
     char opt[1024];             // receiver options
     int fast_acq;               // fast acquisition flag (0:off, 1:on)
     int64_t srch_credit;        // lock-step search budget credit (Mflop)
+    int nsat_lock;              // lock-step: satellites locked at the last search sync
+    int srch_cold;              // lock-step: the cold search budget applies
     sdr_thread_t thread;        // SDR receiver thread
     sdr_mutex_t mtx;            // lock flag
     sdr_cond_t data_cond;       // lock-step: new IF data (with mtx)

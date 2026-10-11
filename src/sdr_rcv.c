@@ -65,6 +65,8 @@ static int lockstep = 0;        // lock-step file replay (-tscale 0): no data sk
 // global variables ------------------------------------------------------------
 double sdr_max_acq = MAX_ACQ;
 double sdr_srch_budget = 0.0;   // lock-step search budget (Gflop/s, 0:off)
+double sdr_srch_budget_cold = 0.0; // the same until srch_nsat are locked (0:srch_budget)
+int sdr_srch_nsat = 5;          // satellites locked for srch_budget instead of the cold one
 
 // real-to-complex state -------------------------------------------------------
 static inline int rtoc_of(const sdr_rcv_t *rcv, int i)
@@ -1465,18 +1467,50 @@ static void wait_ch_lag(sdr_rcv_t *rcv, int64_t ix, int sync)
     if (waited) sdr_trace_end();
 }
 
+// number of satellites with a locked signal ---------------------------------
+static int nsat_lock(sdr_rcv_t *rcv)
+{
+    int n = 0;
+    
+    for (int i = 0; i < rcv->nch; i++) {
+        if (rcv->th[i]->ch->state != SDR_STATE_LOCK) continue;
+        int j = 0;
+        for ( ; j < i; j++) {
+            if (rcv->th[j]->ch->state == SDR_STATE_LOCK &&
+                !strcmp(rcv->th[j]->ch->sat, rcv->th[i]->ch->sat)) break;
+        }
+        if (j == i) n++;
+    }
+    return n;
+}
+
+// lock-step search budget (Gflop/s): the cold one until srch_nsat satellites
+// were locked at the last sync, and again when locks drop (a jammer) ---------
+static double srch_budget(sdr_rcv_t *rcv, int64_t ix)
+{
+    int cold = sdr_srch_budget_cold > 0.0 && rcv->nsat_lock < sdr_srch_nsat;
+    
+    if (cold != rcv->srch_cold) { // starts at 0, so a cold start is logged
+        sdr_log(3, "$LOG,%.3f,-,0,SEARCH BUDGET %s (%d SATS LOCKED)",
+            ix * SDR_CYC, cold ? "COLD" : "STEADY", rcv->nsat_lock);
+        rcv->srch_cold = cold;
+    }
+    return cold ? sdr_srch_budget_cold : sdr_srch_budget;
+}
+
 // lock-step: start search on synced CHs, so data alone decides it. With a
-// budget, a start spends credit that refills at the budget rate --------------
+// budget, a start spends credit that refills at the budget rate. The locks
+// are counted after the sync, so they too depend on the data only ----------
 static void update_srch_ch_ls(sdr_rcv_t *rcv, int64_t ix)
 {
-    int64_t slot = (int64_t)(sdr_srch_budget * 1e3 * SRCH_CYC_LS * SDR_CYC);
-    
     if (ix % SRCH_CYC_LS) return;
     if (sdr_srch_budget > 0.0) {
+        int64_t slot = (int64_t)(srch_budget(rcv, ix) * 1e3 * SRCH_CYC_LS * SDR_CYC);
         rcv->srch_credit = MIN(rcv->srch_credit + slot, slot);
         if (rcv->srch_credit <= 0) return;
     }
     wait_ch_lag(rcv, ix, 1);
+    rcv->nsat_lock = nsat_lock(rcv);
     start_srch_ch(rcv, ix);
 }
 
@@ -2169,5 +2203,7 @@ void sdr_rcv_setopt(const char *opt, double value)
     else if (!strcmp(opt, "bump_jump"  )) sdr_bump_jump = (int)value;
     else if (!strcmp(opt, "max_acq"    )) sdr_max_acq     = value;
     else if (!strcmp(opt, "srch_budget")) sdr_srch_budget = value;
+    else if (!strcmp(opt, "srch_budget_cold")) sdr_srch_budget_cold = value;
+    else if (!strcmp(opt, "srch_nsat"  )) sdr_srch_nsat   = (int)value;
     else fprintf(stderr, "sdr_rcv_setopt error opt=%s\n", opt);
 }
