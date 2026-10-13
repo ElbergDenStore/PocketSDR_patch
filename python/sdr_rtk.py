@@ -33,6 +33,8 @@ elif 'macOS' in env:
     lib = dir + '/../lib/macos/librtk.so'
 else: # linux or Raspberry Pi OS
     lib = dir + '/../lib/linux/librtk.so'
+if os.environ.get('POCKETSDR_LIB'): # library directory of an out-of-tree build
+    lib = os.path.join(os.environ['POCKETSDR_LIB'], 'librtk.so')
 try:
     librtk = cdll.LoadLibrary(lib)
 except:

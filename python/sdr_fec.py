@@ -36,6 +36,8 @@ elif 'macOS' in env:
     lib = dir + '/../lib/macos/libsdr.so'
 else: # linux or Raspberry Pi OS
     lib = dir + '/../lib/linux/libsdr.so'
+if os.environ.get('POCKETSDR_LIB'): # library directory of an out-of-tree build
+    lib = os.path.join(os.environ['POCKETSDR_LIB'], 'libsdr.so')
 try:
     libsdr = cdll.LoadLibrary(lib)
 except:
