@@ -63,6 +63,7 @@
 //  2026-07-24  1.30 support multiple log streams
 //                   add API sdr_log_add_str(), sdr_log_rm_str()
 //  2026-08-08  1.31 fix memory leak of stream in sdr_str_close()
+//  2026-10-14  1.32 one IF data FFT per search in sdr_search_code()
 //
 #include <math.h>
 #include <stdarg.h>
@@ -703,6 +704,11 @@ int sdr_tag_read(const char *file, char *prog, gtime_t *time, int *fmt,
     return 1;
 }
 
+// code search with Doppler bins k FFT bins apart (below) --------------------
+static void search_code_shift(const sdr_cpx_t *code_fft, const sdr_buff_t *buff,
+    int ix, int N, double fs, double fc, int k, int len_fds, sdr_cpx_t *C,
+    float *P);
+
 //------------------------------------------------------------------------------
 //  Parallel code search in digitized IF data.
 //
@@ -727,7 +733,16 @@ void sdr_search_code(const sdr_cpx_t *code_fft, double T,
     const float *fds, int len_fds, float *P)
 {
     sdr_cpx_t *C = sdr_cpx_malloc(N);
+    double step = len_fds > 1 ? (fds[1] - fds[0]) * N / fs : 0.0;
+    int k = (int)floor(step + 0.5);
     
+    // Doppler step of k FFT bins: one IF data FFT, each bin a circular shift
+    if (k > 0 && fabs(step - k) < 1e-3) {
+        search_code_shift(code_fft, buff, ix, N, fs, fi + fds[0], k, len_fds,
+            C, P);
+        sdr_cpx_free(C);
+        return;
+    }
     for (int i = 0; i < len_fds; i++) {
         
         // mix carrier and FFT correlator
@@ -1363,6 +1378,19 @@ void sdr_corr_std_cpx(const sdr_cpx_t *buff, int len_buff, int ix, int N,
     sdr_buff_free(buff_cpx8);
 }
 
+// mix carrier as complex float, across IF buffer boundary ---------------------
+static void mix_carr_cpx(const sdr_buff_t *buff, int ix, int N, double phi,
+    double step, sdr_cpx_t *cpx)
+{
+    if (ix + N <= buff->N) {
+        mix_carr_f32(buff, ix, N, phi, step, cpx);
+    } else {
+        int n = buff->N - ix;
+        mix_carr_f32(buff, ix, n, phi, step, cpx);
+        mix_carr_f32(buff, 0, N - n, phi + step * n, step, cpx + n);
+    }
+}
+
 // persistent scratch buffer for FFT correlator ---------------------------------
 static sdr_cpx_t *corr_fft_buff(int N)
 {
@@ -1375,6 +1403,35 @@ static sdr_cpx_t *corr_fft_buff(int N)
         N_buff = N;
     }
     return cpx;
+}
+
+// code search with Doppler bins k FFT bins apart: spectrum of the IF data mixed
+// by fc, shifted by i * k bins for bin i (= mixing by fc + i * k * fs / N) ----
+static void search_code_shift(const sdr_cpx_t *code_fft, const sdr_buff_t *buff,
+    int ix, int N, double fs, double fc, int k, int len_fds, sdr_cpx_t *C,
+    float *P)
+{
+    sdr_cpx_t *cpx = corr_fft_buff(N), *X = cpx + N;
+    
+    mix_carr_cpx(buff, ix, N, 0.0, fc / fs, cpx);
+    if (!sdr_cpx_fft(cpx, N, SDR_FFT_FORWARD, X)) return;
+    
+    for (int i = 0; i < len_fds; i++) {
+        int s = (int)((int64_t)i * k % N);
+        
+        // ifft(shift(X, s) * code_fft) / N^2
+        sdr_cpx_mul(X + s, code_fft, N - s, 1.0f / N / N, cpx);
+        sdr_cpx_mul(X, code_fft + N - s, s, 1.0f / N / N, cpx + N - s);
+        if (!sdr_cpx_fft(cpx, N, SDR_FFT_BACKWARD, C)) return;
+        
+        // add correlation power
+        for (int j = 0; j < N; j++) {
+            P[i*N+j] += SQR(C[j][0]) + SQR(C[j][1]); // abs(C[j]) ** 2
+        }
+        if (i % 22 == 21) { // release cpu
+            sdr_sleep_msec(1);
+        }
+    }
 }
 
 //------------------------------------------------------------------------------
@@ -1399,16 +1456,9 @@ void sdr_corr_fft(const sdr_buff_t *buff, int ix, int N, double fs, double fc,
     double phi, const sdr_cpx_t *code_fft, sdr_cpx_t *corr)
 {
     sdr_cpx_t *cpx = corr_fft_buff(N);
-    double step = fc / fs;
     
-    // mix carrier as complex float
-    if (ix + N <= buff->N) {
-        mix_carr_f32(buff, ix, N, phi, step, cpx);
-    } else { // across IF buffer boundary
-        int n = buff->N - ix;
-        mix_carr_f32(buff, ix, n, phi, step, cpx);
-        mix_carr_f32(buff, 0, N - n, phi + step * n, step, cpx + n);
-    }
+    mix_carr_cpx(buff, ix, N, phi, fc / fs, cpx);
+    
     // ifft(fft(data) * code_fft) / N^2
     if (sdr_cpx_fft(cpx, N, SDR_FFT_FORWARD, cpx + N)) {
         sdr_cpx_mul(cpx + N, code_fft, N, 1.0f / N / N, cpx);

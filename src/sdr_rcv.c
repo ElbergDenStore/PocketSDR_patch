@@ -1350,8 +1350,8 @@ static void update_buff_use(sdr_rcv_t *rcv)
     }
 }
 
-// nominal work of a search on CH (Mflop): 2 FFTs of 2N points per Doppler bin
-// and integration, at 5 M log2(M) flop each (FFTW's convention) -------------
+// nominal work of a search on CH (Mflop): per integration, 1 forward FFT of 2N
+// points and 1 inverse per Doppler bin, at 5 M log2(M) flop each (FFTW's) ---
 static int64_t srch_cost(const sdr_ch_t *ch)
 {
     extern double sdr_t_acq, sdr_t_acq_ext;
@@ -1360,7 +1360,7 @@ static int64_t srch_cost(const sdr_ch_t *ch)
     
     if (assisted) nbin = ch->acq->fd_ext_n > 0 ? ch->acq->fd_ext_n : 3;
     while (nrep * ch->T < t_acq) nrep++; // as in search_sig()
-    return (int64_t)(nbin * nrep * 2.0 * 5.0 * M * log2(M) * 1e-6 + 0.5);
+    return (int64_t)((nbin + 1) * nrep * 5.0 * M * log2(M) * 1e-6 + 0.5);
 }
 
 // start signal search on CH i (lock-step budget: spend its cost) -------------
