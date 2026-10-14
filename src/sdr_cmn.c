@@ -150,7 +150,9 @@ void sdr_sleep_msec(int msec)
 #else
     struct timespec ts = {0, 0};
     
-    ts.tv_nsec = (long)(msec * 1000000);
+    // nanosleep() rejects tv_nsec >= 1e9 (EINVAL) and returns at once
+    ts.tv_sec = msec / 1000;
+    ts.tv_nsec = (long)(msec % 1000) * 1000000;
     nanosleep(&ts, NULL);
 #endif
 }

@@ -7,6 +7,26 @@
 
 ---
 
+## **This fork (branch `aj`)**
+
+`ElbergDenStore/PocketSDR_patch`, used by the anti-jam receiver `ElbergDenStore/kraken-antijam`
+(its README, "PocketSDR fork"). Upstream `03787da` (v0.20) plus:
+
+- `pocket_trk -tscale 0`: lock-step file replay, as fast as the CPU allows, no data skipped.
+- Lock-step searches paced by the data, so a replay finds the same satellites every run.
+- Search CPU budget (`srch_budget`); data signals with a pilot searched with the pilot's Doppler;
+  `-fast` takes its time from the data.
+- `-trace path`: slices on ftrace's trace marker and named threads; lock-step channels wait on a
+  condition variable.
+- Two search budgets (`srch_budget_cold` until `srch_nsat` satellites are locked).
+- Python modules load `libsdr.so`/`librtk.so` from `$POCKETSDR_LIB` if set.
+- **Upstream bug fixed here (not reported upstream):** `sdr_sleep_msec()` (`src/sdr_cmn.c`) put the
+  whole wait into `tv_nsec`, which `nanosleep()` rejects for waits of 1 s or more, and overflowed
+  `int` from 2148 ms. So `pocket_trk -ti 1` redrew its table ~100k times a second, and the 1.5 s wait
+  for USB re-enumeration (`DEV_RESET_MS`) did not wait.
+
+---
+
 ## **Overview**
 
 **Pocket SDR** is an open-source Global Navigation Satellite System (GNSS) receiver based
