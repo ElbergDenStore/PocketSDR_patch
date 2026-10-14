@@ -292,6 +292,8 @@ typedef struct {                // SDR receiver channel thread type
     int64_t srch_ix;            // IF data index of last search start (cyc)
     int isig;                   // signal index (lock-step search budget)
     int trace_state;            // CH state of open trace slice (0: none)
+    int park;                   // lock-step: IDLE, waiting for a search start
+    sdr_cond_t cond;            // lock-step: search start or stop
     struct sdr_rcv_tag *rcv;    // pointer to SDR receiver
     sdr_thread_t thread;        // SDR receiver channel thread
 } sdr_ch_th_t;

@@ -22,6 +22,8 @@
 - Python modules load `libsdr.so`/`librtk.so` from `$POCKETSDR_LIB` if set.
 - `sdr_search_code()` FFTs the IF data once per search; each Doppler bin is a shift of its spectrum.
 - Lock-step searches: a round robin per signal, each with an equal share of the budget.
+- Lock-step: an idle channel thread sleeps until its search starts; the two budgets count the
+  locks of synced channels only, so the switch depends on the data alone.
 - **Upstream bug fixed here (not reported upstream):** `sdr_sleep_msec()` (`src/sdr_cmn.c`) put the
   whole wait into `tv_nsec`, which `nanosleep()` rejects for waits of 1 s or more, and overflowed
   `int` from 2148 ms. So `pocket_trk -ti 1` redrew its table ~100k times a second, and the 1.5 s wait

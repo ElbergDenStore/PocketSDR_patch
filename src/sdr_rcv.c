@@ -48,6 +48,7 @@
 #define SRCH_LAG_LS (MAX_BUFF / 2) // lock-step: free CH lag after search start (* SDR_CYC)
 #define WAKE_CYC_LS 50          // lock-step: CH wake-up cycle (* SDR_CYC)
 #define WAIT_LS    100          // lock-step: max wait for a wake-up (ms)
+#define PARK_LS    1000         // lock-step: max wait of an IDLE CH (ms)
 
 static int lockstep = 0;        // lock-step file replay (-tscale 0): no data skipped
 #define MAX_BAR    12           // C/N0 bar width
@@ -545,6 +546,7 @@ static sdr_ch_th_t *ch_th_new(const char *sig, int prn, double fi, double fs,
         return NULL;
     }
     th->srch_ix = -SRCH_LAG_LS;
+    sdr_cond_init(&th->cond);
     th->rcv = rcv;
     return th;
 }
@@ -575,13 +577,24 @@ static void trace_ch_state(sdr_ch_th_t *th)
     th->trace_state = state;
 }
 
-// lock-step: report CH progress, then wait for new IF data --------------------
+// lock-step: report CH progress, then wait for new IF data. An IDLE CH parks
+// until its search starts, then skips to where it would have caught up --------
 static void wait_data_ls(sdr_ch_th_t *th, int n)
 {
     sdr_rcv_t *rcv = th->rcv;
     
     sdr_mutex_lock(&rcv->mtx);
     sdr_cond_broadcast(&rcv->ch_cond);
+    if (th->ch->state == SDR_STATE_IDLE) {
+        th->park = 1;
+        while (th->state && th->ch->state == SDR_STATE_IDLE) {
+            sdr_cond_wait(&th->cond, &rcv->mtx, PARK_LS);
+        }
+        th->park = 0;
+        if (th->ix + 2 * n <= th->srch_ix) {
+            th->ix += ((th->srch_ix - th->ix) / n - 1) * n;
+        }
+    }
     while (th->state && th->ix + 2 * n > rcv->ix) {
         if (!sdr_cond_wait(&rcv->data_cond, &rcv->mtx, WAIT_LS)) break;
     }
@@ -601,7 +614,8 @@ static void *ch_thread(void *arg)
     
     while (th->state) {
         int64_t ix = get_buff_ix(th->rcv);
-        for ( ; th->ix + 2 * n <= ix && th->state; th->ix += n) {
+        for ( ; th->ix + 2 * n <= ix && th->state &&
+            (!lockstep || ch->state != SDR_STATE_IDLE); th->ix += n) {
             
             // update SDR receiver CH
             trace_ch_state(th);
@@ -641,6 +655,7 @@ static void ch_th_stop(sdr_ch_th_t *th)
     th->state = 0;
     sdr_mutex_lock(&th->rcv->mtx);
     sdr_cond_broadcast(&th->rcv->data_cond);
+    sdr_cond_broadcast(&th->cond);
     sdr_mutex_unlock(&th->rcv->mtx);
 }
 
@@ -1393,6 +1408,11 @@ static int start_srch(sdr_rcv_t *rcv, int i, int64_t ix)
     rcv->ich = i;
     rcv->th[i]->ch->state = SDR_STATE_SRCH;
     rcv->th[i]->srch_ix = ix;
+    if (lockstep) { // unpark the CH
+        sdr_mutex_lock(&rcv->mtx);
+        sdr_cond_broadcast(&rcv->th[i]->cond);
+        sdr_mutex_unlock(&rcv->mtx);
+    }
     return 1;
 }
 
@@ -1465,7 +1485,8 @@ static void wake_ch_ls(sdr_rcv_t *rcv)
     sdr_mutex_unlock(&rcv->mtx);
 }
 
-// lock-step: wait for CHs within LOCK_LAG of ix (sync: all data up to ix) ----
+// lock-step: wait for CHs within LOCK_LAG of ix (sync: all data up to ix),
+// except parked ones ----------------------------------------------------------
 static void wait_ch_lag(sdr_rcv_t *rcv, int64_t ix, int sync)
 {
     int waited = 0;
@@ -1475,8 +1496,8 @@ static void wait_ch_lag(sdr_rcv_t *rcv, int64_t ix, int sync)
         sdr_ch_th_t *th = rcv->th[i];
         int n = th->ch->N / rcv->N;
         int max_lag = th->ch->state == SDR_STATE_SRCH ? MAX_BUFF / 2 : LOCK_LAG;
-        int wait = sync ? th->ix + 2 * n <= ix && !srch_lag(th, ix) :
-            ix - th->ix > max_lag;
+        int wait = th->park ? 0 : sync ?
+            th->ix + 2 * n <= ix && !srch_lag(th, ix) : ix - th->ix > max_lag;
         if (!wait) {
             i++;
             continue;
@@ -1492,16 +1513,23 @@ static void wait_ch_lag(sdr_rcv_t *rcv, int64_t ix, int sync)
     if (waited) sdr_trace_end();
 }
 
+// test if CH is locked, by the data up to ix: a CH after a recent search start
+// is not synced, so its state depends on the thread timing --------------------
+static int ch_locked(const sdr_ch_th_t *th, int64_t ix)
+{
+    return th->ch->state == SDR_STATE_LOCK && !srch_lag(th, ix);
+}
+
 // number of satellites with a locked signal ---------------------------------
-static int nsat_lock(sdr_rcv_t *rcv)
+static int nsat_lock(sdr_rcv_t *rcv, int64_t ix)
 {
     int n = 0;
     
     for (int i = 0; i < rcv->nch; i++) {
-        if (rcv->th[i]->ch->state != SDR_STATE_LOCK) continue;
+        if (!ch_locked(rcv->th[i], ix)) continue;
         int j = 0;
         for ( ; j < i; j++) {
-            if (rcv->th[j]->ch->state == SDR_STATE_LOCK &&
+            if (ch_locked(rcv->th[j], ix) &&
                 !strcmp(rcv->th[j]->ch->sat, rcv->th[i]->ch->sat)) break;
         }
         if (j == i) n++;
@@ -1527,7 +1555,7 @@ static double srch_budget(sdr_rcv_t *rcv, int64_t ix)
 // budget, each signal has its own round robin and credit: a start spends its
 // cost, and the credits refill by equal shares of the budget among the
 // signals searched or in debt at the last slot, so a cheap signal comes round
-// sooner. The locks are counted after the sync, so they too depend on the
+// sooner. The locks are counted on the synced CHs, so they too depend on the
 // data only ---------------------------------------------------------------
 static void update_srch_ch_ls(sdr_rcv_t *rcv, int64_t ix)
 {
@@ -1536,7 +1564,7 @@ static void update_srch_ch_ls(sdr_rcv_t *rcv, int64_t ix)
     if (ix % SRCH_CYC_LS) return;
     if (sdr_srch_budget <= 0.0) {
         wait_ch_lag(rcv, ix, 1);
-        rcv->nsat_lock = nsat_lock(rcv);
+        rcv->nsat_lock = nsat_lock(rcv, ix);
         start_srch_ch(rcv, ix, -1);
         return;
     }
@@ -1549,7 +1577,7 @@ static void update_srch_ch_ls(sdr_rcv_t *rcv, int64_t ix)
     }
     if (!credit) return;
     wait_ch_lag(rcv, ix, 1);
-    rcv->nsat_lock = nsat_lock(rcv);
+    rcv->nsat_lock = nsat_lock(rcv, ix);
     for (int i = 0; i < rcv->nsig; i++) {
         rcv->srch_act[i] = rcv->srch_credit[i] <= 0 ||
             start_srch_ch(rcv, ix, i);
