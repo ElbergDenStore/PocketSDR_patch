@@ -59,6 +59,7 @@ extern "C" {
 #define SDR_MAX_NPRN   256      // max number of PRNs
 #define SDR_MAX_NCH    1500     // max number of receiver channels
 #define SDR_MAX_NSYM   2000     // max number of symbols
+#define SDR_MAX_NSIG   32       // max number of signals with own search budget
 #define SDR_MAX_DATA   4096     // max length of navigation data
 #define SDR_N_CORRX    101      // number of additional correlators
 #define SDR_MAX_CORR   (6+SDR_N_CORRX) // max number of correlators
@@ -289,6 +290,7 @@ typedef struct {                // SDR receiver channel thread type
     sdr_ch_t *ch;               // SDR receiver channel
     int64_t ix;                 // IF data buffer read pointer (cyc)
     int64_t srch_ix;            // IF data index of last search start (cyc)
+    int isig;                   // signal index (lock-step search budget)
     int trace_state;            // CH state of open trace slice (0: none)
     struct sdr_rcv_tag *rcv;    // pointer to SDR receiver
     sdr_thread_t thread;        // SDR receiver channel thread
@@ -400,7 +402,10 @@ typedef struct sdr_rcv_tag {    // SDR receiver type
     double tscale;              // time scale to replay IF data file
     char opt[1024];             // receiver options
     int fast_acq;               // fast acquisition flag (0:off, 1:on)
-    int64_t srch_credit;        // lock-step search budget credit (Mflop)
+    int nsig;                   // number of signals (lock-step search budget)
+    int64_t srch_credit[SDR_MAX_NSIG]; // lock-step search budget credit per signal (Mflop)
+    int srch_rr[SDR_MAX_NSIG];  // lock-step: last search without Doppler per signal
+    int srch_act[SDR_MAX_NSIG]; // lock-step: signal searched or in debt at the last slot
     int nsat_lock;              // lock-step: satellites locked at the last search sync
     int srch_cold;              // lock-step: the cold search budget applies
     sdr_thread_t thread;        // SDR receiver thread

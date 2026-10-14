@@ -514,6 +514,26 @@ static void out_log_time(double time)
        t[1], t[2], t[3], t[4], t[5]);
 }
 
+// signal index of CHs for the lock-step search budget per signal -------------
+static void set_srch_sig(sdr_rcv_t *rcv)
+{
+    rcv->nsig = 0;
+    for (int i = 0; i < rcv->nch; i++) {
+        int j = 0;
+        for ( ; j < i && strcmp(rcv->th[j]->ch->sig, rcv->th[i]->ch->sig); j++) ;
+        if (j < i) {
+            rcv->th[i]->isig = rcv->th[j]->isig;
+        } else {
+            rcv->th[i]->isig = MIN(rcv->nsig, SDR_MAX_NSIG - 1);
+            rcv->nsig = MIN(rcv->nsig + 1, SDR_MAX_NSIG);
+        }
+    }
+    for (int i = 0; i < rcv->nsig; i++) {
+        rcv->srch_rr[i] = -1;
+        rcv->srch_act[i] = 1;
+    }
+}
+
 // new SDR receiver CH thread --------------------------------------------------
 static sdr_ch_th_t *ch_th_new(const char *sig, int prn, double fi, double fs,
     sdr_rcv_t *rcv)
@@ -784,6 +804,7 @@ sdr_rcv_t *sdr_rcv_new(const char **sigs, const int *prns, int n, int fmt,
     }
     set_lpf(rcv, opt);
     set_srch_ch(rcv, opt);
+    set_srch_sig(rcv);
     
     for (int i = 0; i < nrfch; i++) {
         rcv->buff[i] = sdr_buff_new(rcv->N * MAX_BUFF, 2); // IQ
@@ -1367,7 +1388,7 @@ static int64_t srch_cost(const sdr_ch_t *ch)
 static int start_srch(sdr_rcv_t *rcv, int i, int64_t ix)
 {
     if (lockstep && sdr_srch_budget > 0.0) {
-        rcv->srch_credit -= srch_cost(rcv->th[i]->ch);
+        rcv->srch_credit[rcv->th[i]->isig] -= srch_cost(rcv->th[i]->ch);
     }
     rcv->ich = i;
     rcv->th[i]->ch->state = SDR_STATE_SRCH;
@@ -1375,24 +1396,28 @@ static int start_srch(sdr_rcv_t *rcv, int i, int64_t ix)
     return 1;
 }
 
-// start signal search in next IDLE channel: return 1=started, 0=none. Searches
-// with a known Doppler (re-acquisition, assisted) go first: they are cheap and
-// bring the nav data --------------------------------------------------------
-static int start_srch_ch(sdr_rcv_t *rcv, int64_t ix)
+// start signal search in next IDLE channel of signal isig (-1: any): return
+// 1=started, 0=none. Searches with a known Doppler (re-acquisition, assisted)
+// go first: they are cheap and bring the nav data ---------------------------
+static int start_srch_ch(sdr_rcv_t *rcv, int64_t ix, int isig)
 {
+    int *rr = isig >= 0 ? rcv->srch_rr + isig : &rcv->ich_rr;
+    
     for (int i = 1; i <= rcv->nch; i++) {
         int k = (rcv->ich + i) % rcv->nch;
         sdr_ch_th_t *th = rcv->th[k];
         if (th->ch->state != SDR_STATE_IDLE || srch_lag(th, ix)) continue;
+        if (isig >= 0 && th->isig != isig) continue;
         if (re_acq(rcv, th->ch) || assist_acq(rcv, th->ch)) {
             return start_srch(rcv, k, ix);
         }
     }
     for (int i = 1; i <= rcv->nch; i++) {
-        int k = (rcv->ich_rr + i) % rcv->nch;
+        int k = (*rr + i) % rcv->nch;
         sdr_ch_th_t *th = rcv->th[k];
         sdr_ch_t *ch = th->ch;
         if (ch->state != SDR_STATE_IDLE || srch_lag(th, ix)) continue;
+        if (isig >= 0 && th->isig != isig) continue;
         
         // data signal with a pilot: only with the pilot's Doppler (above)
         if (has_pilot(rcv, ch)) continue;
@@ -1406,13 +1431,13 @@ static int start_srch_ch(sdr_rcv_t *rcv, int64_t ix)
                 int nw = (int)(2.0 * FAST_DOP * ch->T + 1);
                 if (nw < 3) nw = 3;
                 ch->acq->fd_ext_n = nw;
-                rcv->ich_rr = k;
+                *rr = k;
                 return start_srch(rcv, k, ix);
             }
         }
         // short code cycle
         if (ch->T <= sdr_max_acq * 1e-3 && ch->sig_srch) {
-            rcv->ich_rr = k;
+            *rr = k;
             return start_srch(rcv, k, ix);
         }
     }
@@ -1429,7 +1454,7 @@ static void update_srch_ch(sdr_rcv_t *rcv)
     if (rcv->ich >= 0 && rcv->th[rcv->ich]->ch->state == SDR_STATE_SRCH) {
         return;
     }
-    start_srch_ch(rcv, get_buff_ix(rcv));
+    start_srch_ch(rcv, get_buff_ix(rcv), -1);
 }
 
 // lock-step: wake up CHs waiting for IF data ---------------------------------
@@ -1499,19 +1524,36 @@ static double srch_budget(sdr_rcv_t *rcv, int64_t ix)
 }
 
 // lock-step: start search on synced CHs, so data alone decides it. With a
-// budget, a start spends credit that refills at the budget rate. The locks
-// are counted after the sync, so they too depend on the data only ----------
+// budget, each signal has its own round robin and credit: a start spends its
+// cost, and the credits refill by equal shares of the budget among the
+// signals searched or in debt at the last slot, so a cheap signal comes round
+// sooner. The locks are counted after the sync, so they too depend on the
+// data only ---------------------------------------------------------------
 static void update_srch_ch_ls(sdr_rcv_t *rcv, int64_t ix)
 {
+    int nact = 0, credit = 0;
+    
     if (ix % SRCH_CYC_LS) return;
-    if (sdr_srch_budget > 0.0) {
-        int64_t slot = (int64_t)(srch_budget(rcv, ix) * 1e3 * SRCH_CYC_LS * SDR_CYC);
-        rcv->srch_credit = MIN(rcv->srch_credit + slot, slot);
-        if (rcv->srch_credit <= 0) return;
+    if (sdr_srch_budget <= 0.0) {
+        wait_ch_lag(rcv, ix, 1);
+        rcv->nsat_lock = nsat_lock(rcv);
+        start_srch_ch(rcv, ix, -1);
+        return;
     }
+    double slot = srch_budget(rcv, ix) * 1e3 * SRCH_CYC_LS * SDR_CYC;
+    for (int i = 0; i < rcv->nsig; i++) nact += rcv->srch_act[i];
+    int64_t share = (int64_t)(slot / (nact > 0 ? nact : 1));
+    for (int i = 0; i < rcv->nsig; i++) {
+        rcv->srch_credit[i] = MIN(rcv->srch_credit[i] + share, share);
+        credit |= rcv->srch_credit[i] > 0;
+    }
+    if (!credit) return;
     wait_ch_lag(rcv, ix, 1);
     rcv->nsat_lock = nsat_lock(rcv);
-    start_srch_ch(rcv, ix);
+    for (int i = 0; i < rcv->nsig; i++) {
+        rcv->srch_act[i] = rcv->srch_credit[i] <= 0 ||
+            start_srch_ch(rcv, ix, i);
+    }
 }
 
 // SDR receiver thread ---------------------------------------------------------
