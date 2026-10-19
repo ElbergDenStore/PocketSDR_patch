@@ -61,6 +61,7 @@ static int lockstep = 0;        // lock-step file replay (-tscale 0): no data sk
 
 #define SQR(x)     ((x) * (x))
 #define MIN(x, y)  ((x) < (y) ? (x) : (y))
+#define MAX(x, y)  ((x) > (y) ? (x) : (y))
 #define CLIP(x, min, max) ((x) < (min) ? (min) : ((x) > (max) ? (max) : (x)))
 
 // global variables ------------------------------------------------------------
@@ -1513,6 +1514,20 @@ static void wait_ch_lag(sdr_rcv_t *rcv, int64_t ix, int sync)
     if (waited) sdr_trace_end();
 }
 
+// lock-step: test if every CH has passed the PVT epoch cycle. Once all have
+// its data (2 code periods after it, lag), wait for the lagging ones: the epoch
+// then holds every CH's report and none of the next epoch's ------------------
+static int epoch_passed_ls(sdr_rcv_t *rcv, int64_t ix, int lag)
+{
+    sdr_mutex_lock(&rcv->pvt->mtx);
+    int64_t epoch_ix = rcv->pvt->ix;
+    sdr_mutex_unlock(&rcv->pvt->mtx);
+    
+    if (epoch_ix <= 0 || ix < epoch_ix + lag) return 0;
+    wait_ch_lag(rcv, ix, 1);
+    return 1;
+}
+
 // test if CH is locked, by the data up to ix: a CH after a recent search start
 // is not synced, so its state depends on the thread timing --------------------
 static int ch_locked(const sdr_ch_th_t *th, int64_t ix)
@@ -1600,6 +1615,11 @@ static void *rcv_thread(void *arg)
     rcv->stats.sum = 0.0;
     sdr_thread_name("rcv");
     
+    int lag_ls = 0; // lock-step: PVT epoch lag (cyc), 2 longest code periods
+    for (int i = 0; i < rcv->nch; i++) {
+        lag_ls = MAX(lag_ls, 2 * rcv->th[i]->ch->N / rcv->N);
+    }
+    
     for (int64_t ix = 0; rcv->state; ix++) {
         if (ix % LOG_CYC == 0) {
             update_buff_use(rcv);
@@ -1638,7 +1658,9 @@ static void *rcv_thread(void *arg)
         }
         
         // update PVT solution
-        sdr_pvt_udsol(rcv->pvt, ix);
+        if (!lockstep || epoch_passed_ls(rcv, ix, lag_ls)) {
+            sdr_pvt_udsol(rcv->pvt, ix);
+        }
         
         // update IF data stats and scale
         update_data_stats(rcv, raw);
