@@ -1553,7 +1553,7 @@ static int nsat_lock(sdr_rcv_t *rcv, int64_t ix)
 }
 
 // lock-step search budget (Gflop/s): the cold one until srch_nsat satellites
-// were locked at the last sync, and again when locks drop (a jammer) ---------
+// were locked at the last sync, and again when locks drop (an interferer) --------
 static double srch_budget(sdr_rcv_t *rcv, int64_t ix)
 {
     int cold = sdr_srch_budget_cold > 0.0 && rcv->nsat_lock < sdr_srch_nsat;

@@ -7,9 +7,9 @@
 
 ---
 
-## **This fork (branch `aj`)**
+## **This fork (branch `CRPA-Research`)**
 
-`ElbergDenStore/PocketSDR_patch`, used by the anti-jam receiver `ElbergDenStore/kraken-antijam`
+`ElbergDenStore/PocketSDR_patch`, used by the interference-mitigating receiver `ElbergDenStore/Kraken-CRPA`
 (its README, "PocketSDR fork"). Upstream `03787da` (v0.20) plus:
 
 - `pocket_trk -tscale 0`: lock-step file replay, as fast as the CPU allows, no data skipped.
