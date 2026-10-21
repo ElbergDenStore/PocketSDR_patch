@@ -2271,7 +2271,7 @@ void sdr_rcv_setopt(const char *opt, double value)
     extern double sdr_epoch, sdr_lag_epoch, sdr_el_mask, sdr_sp_corr, sdr_t_acq;
     extern double sdr_t_acq_ext, sdr_t_coh, sdr_thres_cn0_ext;
     extern double sdr_t_dll, sdr_b_dll, sdr_b_pll, sdr_b_fll_w, sdr_b_fll_n;
-    extern double sdr_max_dop, sdr_thres_cn0_l, sdr_thres_cn0_u, sdr_thres_pli;
+    extern double sdr_max_dop, sdr_dop_ctr, sdr_thres_cn0_l, sdr_thres_cn0_u, sdr_thres_pli;
     extern int sdr_bump_jump, sdr_lost_th;
     if      (!strcmp(opt, "epoch"      )) sdr_epoch       = value;
     else if (!strcmp(opt, "lag_epoch"  )) sdr_lag_epoch   = value;
@@ -2286,6 +2286,7 @@ void sdr_rcv_setopt(const char *opt, double value)
     else if (!strcmp(opt, "b_fll_w"    )) sdr_b_fll_w     = value;
     else if (!strcmp(opt, "b_fll_n"    )) sdr_b_fll_n     = value;
     else if (!strcmp(opt, "max_dop"    )) sdr_max_dop     = value;
+    else if (!strcmp(opt, "dop_ctr"    )) sdr_dop_ctr     = value;
     else if (!strcmp(opt, "thres_cn0_l")) sdr_thres_cn0_l = value;
     else if (!strcmp(opt, "thres_cn0_u")) sdr_thres_cn0_u = value;
     else if (!strcmp(opt, "thres_cn0_ext") && value > 0.0)

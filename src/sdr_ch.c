@@ -91,6 +91,7 @@ double sdr_b_pll   = B_PLL;
 double sdr_b_fll_w = B_FLL_W;
 double sdr_b_fll_n = B_FLL_N;
 double sdr_max_dop = MAX_DOP;
+double sdr_dop_ctr = 0.0;   // center of the Doppler search bins (Hz)
 double sdr_thres_cn0_l = THRES_CN0_L;
 double sdr_thres_cn0_u = THRES_CN0_U;
 double sdr_thres_cn0_ext = THRES_CN0_EXT;
@@ -302,7 +303,7 @@ static sdr_acq_t *acq_new(const char *sig, int prn, const int8_t *code,
     }
     acq->fd_ext = 0.0;
     acq->fd_ext_valid = 0;
-    acq->fds = sdr_dop_bins(T, 0.0f, (float)sdr_max_dop, &acq->len_fds);
+    acq->fds = sdr_dop_bins(T, (float)sdr_dop_ctr, (float)sdr_max_dop, &acq->len_fds);
     acq->P_sum = NULL;
     acq->n_sum = 0;
     return acq;
