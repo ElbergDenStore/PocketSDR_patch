@@ -66,9 +66,14 @@ static int lockstep = 0;        // lock-step file replay (-tscale 0): no data sk
 
 // global variables ------------------------------------------------------------
 double sdr_max_acq = MAX_ACQ;
-double sdr_srch_budget = 0.0;   // lock-step search budget (Gflop/s, 0:off)
+double sdr_srch_budget = 0.0;   // lock-step search budget (CPU s per s of data, 0:off)
 double sdr_srch_budget_cold = 0.0; // the same until srch_nsat are locked (0:srch_budget)
 int sdr_srch_nsat = 5;          // satellites locked for srch_budget instead of the cold one
+static struct {                 // the host's CPU ns per nominal flop of a signal's
+    char sig[16];               // search (options srch_ns_<sig>; default 1)
+    double ns;
+} srch_ns[SDR_MAX_NSIG];
+static int n_srch_ns = 0;
 
 // real-to-complex state -------------------------------------------------------
 static inline int rtoc_of(const sdr_rcv_t *rcv, int i)
@@ -578,6 +583,19 @@ static void trace_ch_state(sdr_ch_th_t *th)
     th->trace_state = state;
 }
 
+// a search's thread CPU time: logged when it ends with its nominal work, the
+// host's cost per flop that srch_ns_<sig> calibrates ----------------------------
+static double srch_mflop(const sdr_ch_t *ch);
+
+static void log_srch_cpu(sdr_ch_th_t *th, double cpu)
+{
+    th->srch_cpu += sdr_cpu_time() - cpu;
+    if (th->ch->state == SDR_STATE_SRCH) return;
+    sdr_log(3, "$LOG,%.3f,%s,%d,SEARCH CPU (%.1f,%.3f)", th->ix * SDR_CYC,
+        th->ch->sig, th->ch->prn, th->srch_mflop, th->srch_cpu * 1e3);
+    th->srch_cpu = 0.0;
+}
+
 // lock-step: report CH progress, then wait for new IF data. An IDLE CH parks
 // until its search starts, then skips to where it would have caught up --------
 static void wait_data_ls(sdr_ch_th_t *th, int n)
@@ -620,8 +638,12 @@ static void *ch_thread(void *arg)
             
             // update SDR receiver CH
             trace_ch_state(th);
+            int srch = ch->state == SDR_STATE_SRCH;
+            if (srch && ch->acq->n_sum == 0) th->srch_mflop = srch_mflop(ch);
+            double cpu = srch ? sdr_cpu_time() : 0.0;
             sdr_ch_update(ch, th->ix * SDR_CYC, th->rcv->buff[ch->rf_ch],
                 th->rcv->N * (int)(th->ix % MAX_BUFF));
+            if (srch) log_srch_cpu(th, cpu);
             trace_ch_state(th);
             
             // update navigation data
@@ -1389,7 +1411,7 @@ static void update_buff_use(sdr_rcv_t *rcv)
 
 // nominal work of a search on CH (Mflop): per integration, 1 forward FFT of 2N
 // points and 1 inverse per Doppler bin, at 5 M log2(M) flop each (FFTW's) ---
-static int64_t srch_cost(const sdr_ch_t *ch)
+static double srch_mflop(const sdr_ch_t *ch)
 {
     extern double sdr_t_acq, sdr_t_acq_ext;
     int assisted = ch->acq->fd_ext_valid, nbin = ch->acq->len_fds, nrep = 1;
@@ -1397,7 +1419,19 @@ static int64_t srch_cost(const sdr_ch_t *ch)
     
     if (assisted) nbin = ch->acq->fd_ext_n > 0 ? ch->acq->fd_ext_n : 3;
     while (nrep * ch->T < t_acq) nrep++; // as in search_sig()
-    return (int64_t)((nbin + 1) * nrep * 5.0 * M * log2(M) * 1e-6 + 0.5);
+    return (nbin + 1) * nrep * 5.0 * M * log2(M) * 1e-6;
+}
+
+// CPU cost of a search on CH (us): its nominal work at the host's cost per flop
+// of its signal, so a budget in cores holds for any signals --------------------
+static int64_t srch_cost(const sdr_ch_t *ch)
+{
+    double ns = 1.0;
+    
+    for (int i = 0; i < n_srch_ns; i++) {
+        if (!strcmp(srch_ns[i].sig, ch->sig)) ns = srch_ns[i].ns;
+    }
+    return (int64_t)(srch_mflop(ch) * ns * 1e3 + 0.5);
 }
 
 // start signal search on CH i (lock-step budget: spend its cost) -------------
@@ -1552,7 +1586,7 @@ static int nsat_lock(sdr_rcv_t *rcv, int64_t ix)
     return n;
 }
 
-// lock-step search budget (Gflop/s): the cold one until srch_nsat satellites
+// lock-step search budget (cores): the cold one until srch_nsat satellites
 // were locked at the last sync, and again when locks drop (an interferer) --------
 static double srch_budget(sdr_rcv_t *rcv, int64_t ix)
 {
@@ -1567,11 +1601,11 @@ static double srch_budget(sdr_rcv_t *rcv, int64_t ix)
 }
 
 // lock-step: start search on synced CHs, so data alone decides it. With a
-// budget, each signal has its own round robin and credit: a start spends its
-// cost, and the credits refill by equal shares of the budget among the
-// signals searched or in debt at the last slot, so a cheap signal comes round
-// sooner. The locks are counted on the synced CHs, so they too depend on the
-// data only ---------------------------------------------------------------
+// budget, each signal has its own round robin and credit: starts spend their
+// CPU cost until the credit is gone, and the credits refill by equal shares of
+// the budget among the signals searched or in debt at the last slot, so a
+// cheap signal comes round sooner. The locks are counted on the synced CHs,
+// so they too depend on the data only -------------------------------------
 static void update_srch_ch_ls(sdr_rcv_t *rcv, int64_t ix)
 {
     int nact = 0, credit = 0;
@@ -1583,7 +1617,7 @@ static void update_srch_ch_ls(sdr_rcv_t *rcv, int64_t ix)
         start_srch_ch(rcv, ix, -1);
         return;
     }
-    double slot = srch_budget(rcv, ix) * 1e3 * SRCH_CYC_LS * SDR_CYC;
+    double slot = srch_budget(rcv, ix) * 1e6 * SRCH_CYC_LS * SDR_CYC;
     for (int i = 0; i < rcv->nsig; i++) nact += rcv->srch_act[i];
     int64_t share = (int64_t)(slot / (nact > 0 ? nact : 1));
     for (int i = 0; i < rcv->nsig; i++) {
@@ -1594,8 +1628,9 @@ static void update_srch_ch_ls(sdr_rcv_t *rcv, int64_t ix)
     wait_ch_lag(rcv, ix, 1);
     rcv->nsat_lock = nsat_lock(rcv, ix);
     for (int i = 0; i < rcv->nsig; i++) {
-        rcv->srch_act[i] = rcv->srch_credit[i] <= 0 ||
-            start_srch_ch(rcv, ix, i);
+        int started = 0;
+        while (rcv->srch_credit[i] > 0 && start_srch_ch(rcv, ix, i)) started++;
+        rcv->srch_act[i] = rcv->srch_credit[i] <= 0 || started;
     }
 }
 
@@ -2256,6 +2291,21 @@ void sdr_rcv_close(sdr_rcv_t *rcv)
     sdr_rcv_free(rcv);
 }
 
+// the host's CPU ns per nominal search flop of signal sig ---------------------
+static void set_srch_ns(const char *sig, double ns)
+{
+    int i = 0;
+    
+    for ( ; i < n_srch_ns && strcmp(srch_ns[i].sig, sig); i++) ;
+    if (i == SDR_MAX_NSIG) {
+        fprintf(stderr, "sdr_rcv_setopt error: too many srch_ns_<sig>\n");
+        return;
+    }
+    snprintf(srch_ns[i].sig, sizeof(srch_ns[i].sig), "%s", sig);
+    srch_ns[i].ns = ns;
+    if (i == n_srch_ns) n_srch_ns++;
+}
+
 //------------------------------------------------------------------------------
 //  Set SDR receiver options.
 //
@@ -2298,5 +2348,6 @@ void sdr_rcv_setopt(const char *opt, double value)
     else if (!strcmp(opt, "srch_budget")) sdr_srch_budget = value;
     else if (!strcmp(opt, "srch_budget_cold")) sdr_srch_budget_cold = value;
     else if (!strcmp(opt, "srch_nsat"  )) sdr_srch_nsat   = (int)value;
+    else if (!strncmp(opt, "srch_ns_", 8)) set_srch_ns(opt + 8, value);
     else fprintf(stderr, "sdr_rcv_setopt error opt=%s\n", opt);
 }

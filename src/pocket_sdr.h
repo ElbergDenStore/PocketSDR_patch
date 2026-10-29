@@ -292,6 +292,8 @@ typedef struct {                // SDR receiver channel thread type
     int64_t srch_ix;            // IF data index of last search start (cyc)
     int isig;                   // signal index (lock-step search budget)
     int trace_state;            // CH state of open trace slice (0: none)
+    double srch_mflop;          // nominal work of the running search (Mflop)
+    double srch_cpu;            // its thread CPU time so far (s)
     int park;                   // lock-step: IDLE, waiting for a search start
     sdr_cond_t cond;            // lock-step: search start or stop
     struct sdr_rcv_tag *rcv;    // pointer to SDR receiver
@@ -405,7 +407,7 @@ typedef struct sdr_rcv_tag {    // SDR receiver type
     char opt[1024];             // receiver options
     int fast_acq;               // fast acquisition flag (0:off, 1:on)
     int nsig;                   // number of signals (lock-step search budget)
-    int64_t srch_credit[SDR_MAX_NSIG]; // lock-step search budget credit per signal (Mflop)
+    int64_t srch_credit[SDR_MAX_NSIG]; // lock-step search budget credit per signal (CPU us)
     int srch_rr[SDR_MAX_NSIG];  // lock-step: last search without Doppler per signal
     int srch_act[SDR_MAX_NSIG]; // lock-step: signal searched or in debt at the last slot
     int nsat_lock;              // lock-step: satellites locked at the last search sync
@@ -423,6 +425,7 @@ void *sdr_malloc(size_t size);
 void sdr_free(void *p);
 void sdr_get_time(double *t);
 uint32_t sdr_get_tick(void);
+double sdr_cpu_time(void);
 void sdr_sleep_msec(int msec);
 const char *sdr_get_name(void);
 const char *sdr_get_ver(void);

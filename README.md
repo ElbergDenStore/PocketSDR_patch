@@ -19,6 +19,8 @@
 - `-trace path`: slices on ftrace's trace marker and named threads; lock-step channels wait on a
   condition variable.
 - Two search budgets (`srch_budget_cold` until `srch_nsat` satellites are locked).
+- The budget in cores: a search costs its nominal flop × `srch_ns_<sig>` (the host's CPU ns per flop, default 1),
+  a signal starts searches until its share is spent, and `$LOG` records each search's thread CPU (`SEARCH CPU`).
 - Python modules load `libsdr.so`/`librtk.so` from `$POCKETSDR_LIB` if set.
 - `sdr_search_code()` FFTs the IF data once per search; each Doppler bin is a shift of its spectrum.
 - Lock-step searches: a round robin per signal, each with an equal share of the budget.

@@ -134,6 +134,27 @@ uint32_t sdr_get_tick(void)
 }
 
 //------------------------------------------------------------------------------
+//  The calling thread's CPU time.
+//
+//  args:
+//      none
+//
+//  return:
+//      CPU time (s), 0 where the system has no thread clock
+//
+double sdr_cpu_time(void)
+{
+#ifdef WIN32
+    return 0.0;
+#else
+    struct timespec ts = {0, 0};
+    
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    return ts.tv_sec + ts.tv_nsec * 1e-9;
+#endif
+}
+
+//------------------------------------------------------------------------------
 //  Sleep for milli-seconds.
 //  
 //  args:
