@@ -38,6 +38,7 @@
 //  2026-07-19  1.25 add pre-combined E5ABQ replicas (a+b, a-b) to correlate
 //                   both sidebands in one pass once the polarity is calibrated
 //  2026-07-19  1.26 improve low-C/N0 acquisition and pilot tracking
+//  2026-10-30  1.27 searches on GPU hooks (option srch_gpu)
 //
 #include <ctype.h>
 #include <math.h>
@@ -98,6 +99,10 @@ double sdr_thres_cn0_ext = THRES_CN0_EXT;
 double sdr_thres_pli = THRES_PLI; // carrier lock detector threshold
 int sdr_lost_th = LOST_TH; // lost decision count
 int sdr_bump_jump = 0;
+int sdr_srch_gpu = 0;       // searches on the GPU hooks if set (option srch_gpu)
+int (*sdr_srch_gpu_take)(const sdr_ch_t *ch, int M, int len_fds, int k) = NULL;
+int (*sdr_srch_gpu_run)(const sdr_ch_t *ch, const sdr_buff_t *buff, int ix,
+    int M, const float *fds, int len_fds, int k, sdr_srch_res_t *res) = NULL;
 double sdr_e5ab_off = 0.0;  // E5b-E5a group-delay (s)
 double sdr_bump_k = BUMP_K; // bump-jump threshold
 
@@ -537,6 +542,70 @@ static void start_track(sdr_ch_t *ch, double time, double fd, double coff,
     sdr_nav_init(ch->nav);
 }
 
+// Doppler bins and code periods of the search CH starts next ------------------
+static void srch_shape(const sdr_ch_t *ch, int *n, double *df, int *M)
+{
+    int assisted = ch->acq->fd_ext_valid;
+    double t_acq = assisted ? sdr_t_acq_ext : sdr_t_acq;
+    
+    *n = assisted ? (ch->acq->fd_ext_n > 0 ? ch->acq->fd_ext_n : 3) :
+        ch->acq->len_fds;
+    *df = assisted ? 0.5 / ch->T :
+        (*n > 1 ? ch->acq->fds[1] - ch->acq->fds[0] : 0.0);
+    for (*M = 1; *M * ch->T < t_acq; (*M)++) ;
+}
+
+//------------------------------------------------------------------------------
+//  The search CH starts next goes to the GPU (option srch_gpu and the hooks
+//  take its shape). It runs once at the end of t_acq, over its M periods.
+//
+//  args:
+//      ch       (I)  Receiver channel
+//
+//  return:
+//      Doppler step of its bins in FFT bins of 2N points (0: CPU search)
+//
+int sdr_ch_srch_gpu(const sdr_ch_t *ch)
+{
+    int n, M;
+    double df;
+    
+    if (!sdr_srch_gpu || !sdr_srch_gpu_take || !sdr_srch_gpu_run) return 0;
+    srch_shape(ch, &n, &df, &M);
+    double step = df * 2 * ch->N / ch->fs;
+    int k = (int)floor(step + 0.5);
+    if (n < 2 || k <= 0 || fabs(step - k) >= 1e-3) return 0; // as sdr_search_code
+    return sdr_srch_gpu_take(ch, M, n, k) ? k : 0;
+}
+
+// GPU search of the M periods up to ix: C/N0 (dB-Hz, -1: GPU error) --------
+static float search_gpu(sdr_ch_t *ch, const sdr_buff_t *buff, int ix,
+    const float *fds, int n, int *idx, double *fd)
+{
+    sdr_srch_res_t res;
+    int M = ch->acq->n_sum, ix0 = ix - (M - 1) * ch->N;
+    
+    if (ix0 < 0) ix0 += buff->N;
+    if (!sdr_srch_gpu_run(ch, buff, ix0, M, fds, n, ch->acq->gpu, &res)) {
+        return -1.0f;
+    }
+    float *P = (float *)sdr_malloc(sizeof(float) * n);
+    for (int i = 0; i < n; i++) P[i] = 0.0f;
+    for (int i = 0; i < 3; i++) {
+        if (res.ix[0] - 1 + i >= 0 && res.ix[0] - 1 + i < n) {
+            P[res.ix[0]-1+i] = res.P_nb[i];
+        }
+    }
+    ch->acq->gpu_ms = res.ms;
+    idx[0] = res.ix[0];
+    idx[1] = 0;
+    *fd = sdr_fine_dop(P, 1, fds, n, idx);
+    idx[1] = res.ix[1];
+    sdr_free(P);
+    return res.P_ave > 0.0f ? (float)(10.0 * log10((res.P_max - res.P_ave) /
+        res.P_ave / ch->T)) : 0.0f; // as sdr_corr_max
+}
+
 // search signal ---------------------------------------------------------------
 static void search_sig(sdr_ch_t *ch, double time, const sdr_buff_t *buff,
     int ix)
@@ -556,22 +625,35 @@ static void search_sig(sdr_ch_t *ch, double time, const sdr_buff_t *buff,
         fds = fd_ext_bins;
         n = nw;
     }
-    if (!ch->acq->P_sum || ch->acq->n_sum == 0) {
-        sdr_free(ch->acq->P_sum);
-        ch->acq->P_sum = (float *)sdr_malloc(sizeof(float) * 2 * ch->N * n);
+    if (ch->acq->n_sum == 0) ch->acq->gpu = sdr_ch_srch_gpu(ch);
+    if (!ch->acq->gpu) {
+        if (!ch->acq->P_sum || ch->acq->n_sum == 0) {
+            sdr_free(ch->acq->P_sum);
+            ch->acq->P_sum = (float *)sdr_malloc(sizeof(float) * 2 * ch->N * n);
+        }
+        // parallel code search and non-coherent integration
+        sdr_search_code(ch->acq->code_fft, ch->T, buff, ix, 2 * ch->N, ch->fs,
+            ch->fi, fds, n, ch->acq->P_sum);
     }
-    // parallel code search and non-coherent integration
-    sdr_search_code(ch->acq->code_fft, ch->T, buff, ix, 2 * ch->N, ch->fs,
-        ch->fi, fds, n, ch->acq->P_sum);
     ch->acq->n_sum++;
     
     double t_acq = assisted ? sdr_t_acq_ext : sdr_t_acq;
     if (ch->acq->n_sum * ch->T >= t_acq) {
         int idx[2];
+        double fd = 0.0;
+        float cn0;
         
-        // search max correlation power
-        float cn0 = sdr_corr_max(ch->acq->P_sum, 2 * ch->N, ch->N, n, ch->T,
-            idx);
+        // search max correlation power (the GPU's: the whole search now)
+        if (ch->acq->gpu) {
+            cn0 = search_gpu(ch, buff, ix, fds, n, idx, &fd);
+            if (cn0 < 0.0f) {
+                sdr_log(2, "$LOG,%.3f,%s,%d,GPU SEARCH ERROR", time, ch->sig,
+                    ch->prn);
+            }
+        } else {
+            cn0 = sdr_corr_max(ch->acq->P_sum, 2 * ch->N, ch->N, n, ch->T,
+                idx);
+        }
         
         double thres = sdr_thres_cn0_l;
         if (assisted) {
@@ -580,7 +662,9 @@ static void search_sig(sdr_ch_t *ch, double time, const sdr_buff_t *buff,
             thres = MAX(sdr_thres_cn0_ext, lost + 1.0);
         }
         if (cn0 >= thres) {
-            double fd = sdr_fine_dop(ch->acq->P_sum, 2 * ch->N, fds, n, idx);
+            if (!ch->acq->gpu) {
+                fd = sdr_fine_dop(ch->acq->P_sum, 2 * ch->N, fds, n, idx);
+            }
             double coff = idx[1] / ch->fs;
             start_track(ch, time, fd, coff, cn0);
             sdr_log(3, "$LOG,%.3f,%s,%d,SIGNAL FOUND (%.1f,%.1f,%.7f)", ch->time,

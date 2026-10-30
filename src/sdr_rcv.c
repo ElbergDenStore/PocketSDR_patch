@@ -69,9 +69,10 @@ double sdr_max_acq = MAX_ACQ;
 double sdr_srch_budget = 0.0;   // lock-step search budget (CPU s per s of data, 0:off)
 double sdr_srch_budget_cold = 0.0; // the same until srch_nsat are locked (0:srch_budget)
 int sdr_srch_nsat = 5;          // satellites locked for srch_budget instead of the cold one
-static struct {                 // the host's CPU ns per nominal flop of a signal's
-    char sig[16];               // search (options srch_ns_<sig>; default 1)
-    double ns;
+double sdr_srch_budget_gpu = 0.5; // lock-step GPU search budget (GPU s per s of data)
+static struct {                 // the host's CPU (GPU) ns per nominal flop of a
+    char sig[16];               // signal's search (options srch_ns_<sig>,
+    double ns, gpu_ns;          // srch_gpu_ns_<sig>; default 1)
 } srch_ns[SDR_MAX_NSIG];
 static int n_srch_ns = 0;
 
@@ -538,6 +539,22 @@ static void set_srch_sig(sdr_rcv_t *rcv)
     for (int i = 0; i < rcv->nsig; i++) {
         rcv->srch_rr[i] = -1;
         rcv->srch_act[i] = 1;
+        rcv->srch_gpu[i] = 0;
+    }
+    for (int i = 0; i < rcv->nch; i++) { // a signal's cold searches on the GPU
+        int k = rcv->th[i]->isig;
+        if (!rcv->srch_gpu[k]) rcv->srch_gpu[k] = sdr_ch_srch_gpu(rcv->th[i]->ch) > 0;
+    }
+}
+
+// log the signals searched on the GPU -----------------------------------------
+static void log_srch_gpu(const sdr_rcv_t *rcv)
+{
+    for (int i = 0; i < rcv->nch; i++) {
+        int j = 0;
+        for ( ; j < i && rcv->th[j]->isig != rcv->th[i]->isig; j++) ;
+        if (j < i || !rcv->srch_gpu[rcv->th[i]->isig]) continue;
+        sdr_log(3, "$LOG,0.000,%s,0,SEARCH ON GPU", rcv->th[i]->ch->sig);
     }
 }
 
@@ -584,15 +601,22 @@ static void trace_ch_state(sdr_ch_th_t *th)
 }
 
 // a search's thread CPU time: logged when it ends with its nominal work, the
-// host's cost per flop that srch_ns_<sig> calibrates ----------------------------
+// host's cost per flop that srch_ns_<sig> calibrates; a GPU search's GPU time
+// first, for srch_gpu_ns_<sig> ------------------------------------------------
 static double srch_mflop(const sdr_ch_t *ch);
 
 static void log_srch_cpu(sdr_ch_th_t *th, double cpu)
 {
     th->srch_cpu += sdr_cpu_time() - cpu;
     if (th->ch->state == SDR_STATE_SRCH) return;
-    sdr_log(3, "$LOG,%.3f,%s,%d,SEARCH CPU (%.1f,%.3f)", th->ix * SDR_CYC,
-        th->ch->sig, th->ch->prn, th->srch_mflop, th->srch_cpu * 1e3);
+    if (th->ch->acq->gpu) {
+        sdr_log(3, "$LOG,%.3f,%s,%d,SEARCH GPU (%.1f,%.3f,%.3f)",
+            th->ix * SDR_CYC, th->ch->sig, th->ch->prn, th->srch_mflop,
+            th->ch->acq->gpu_ms, th->srch_cpu * 1e3);
+    } else {
+        sdr_log(3, "$LOG,%.3f,%s,%d,SEARCH CPU (%.1f,%.3f)", th->ix * SDR_CYC,
+            th->ch->sig, th->ch->prn, th->srch_mflop, th->srch_cpu * 1e3);
+    }
     th->srch_cpu = 0.0;
 }
 
@@ -1422,14 +1446,17 @@ static double srch_mflop(const sdr_ch_t *ch)
     return (nbin + 1) * nrep * 5.0 * M * log2(M) * 1e-6;
 }
 
-// CPU cost of a search on CH (us): its nominal work at the host's cost per flop
-// of its signal, so a budget in cores holds for any signals --------------------
+// CPU (GPU) cost of a search on CH (us): its nominal work at the host's cost per
+// flop of its signal, so a budget in cores holds for any signals --------------
 static int64_t srch_cost(const sdr_ch_t *ch)
 {
+    int gpu = sdr_ch_srch_gpu(ch) > 0;
     double ns = 1.0;
     
     for (int i = 0; i < n_srch_ns; i++) {
-        if (!strcmp(srch_ns[i].sig, ch->sig)) ns = srch_ns[i].ns;
+        if (!strcmp(srch_ns[i].sig, ch->sig)) {
+            ns = gpu ? srch_ns[i].gpu_ns : srch_ns[i].ns;
+        }
     }
     return (int64_t)(srch_mflop(ch) * ns * 1e3 + 0.5);
 }
@@ -1604,11 +1631,12 @@ static double srch_budget(sdr_rcv_t *rcv, int64_t ix)
 // budget, each signal has its own round robin and credit: starts spend their
 // CPU cost until the credit is gone, and the credits refill by equal shares of
 // the budget among the signals searched or in debt at the last slot, so a
-// cheap signal comes round sooner. The locks are counted on the synced CHs,
-// so they too depend on the data only -------------------------------------
+// cheap signal comes round sooner; the signals searched on the GPU share the
+// GPU budget instead. The locks are counted on the synced CHs, so they too
+// depend on the data only -------------------------------------------------
 static void update_srch_ch_ls(sdr_rcv_t *rcv, int64_t ix)
 {
-    int nact = 0, credit = 0;
+    int nact[2] = {0}, credit = 0;
     
     if (ix % SRCH_CYC_LS) return;
     if (sdr_srch_budget <= 0.0) {
@@ -1617,10 +1645,12 @@ static void update_srch_ch_ls(sdr_rcv_t *rcv, int64_t ix)
         start_srch_ch(rcv, ix, -1);
         return;
     }
-    double slot = srch_budget(rcv, ix) * 1e6 * SRCH_CYC_LS * SDR_CYC;
-    for (int i = 0; i < rcv->nsig; i++) nact += rcv->srch_act[i];
-    int64_t share = (int64_t)(slot / (nact > 0 ? nact : 1));
+    double slot[2] = {srch_budget(rcv, ix), sdr_srch_budget_gpu};
+    for (int i = 0; i < rcv->nsig; i++) nact[rcv->srch_gpu[i]] += rcv->srch_act[i];
     for (int i = 0; i < rcv->nsig; i++) {
+        int g = rcv->srch_gpu[i];
+        int64_t share = (int64_t)(slot[g] * 1e6 * SRCH_CYC_LS * SDR_CYC /
+            (nact[g] > 0 ? nact[g] : 1));
         rcv->srch_credit[i] = MIN(rcv->srch_credit[i] + share, share);
         credit |= rcv->srch_credit[i] > 0;
     }
@@ -1654,6 +1684,7 @@ static void *rcv_thread(void *arg)
     for (int i = 0; i < rcv->nch; i++) {
         lag_ls = MAX(lag_ls, 2 * rcv->th[i]->ch->N / rcv->N);
     }
+    log_srch_gpu(rcv);
     
     for (int64_t ix = 0; rcv->state; ix++) {
         if (ix % LOG_CYC == 0) {
@@ -2291,8 +2322,8 @@ void sdr_rcv_close(sdr_rcv_t *rcv)
     sdr_rcv_free(rcv);
 }
 
-// the host's CPU ns per nominal search flop of signal sig ---------------------
-static void set_srch_ns(const char *sig, double ns)
+// the host's CPU (GPU) ns per nominal search flop of signal sig --------------
+static void set_srch_ns(const char *sig, double ns, int gpu)
 {
     int i = 0;
     
@@ -2301,9 +2332,13 @@ static void set_srch_ns(const char *sig, double ns)
         fprintf(stderr, "sdr_rcv_setopt error: too many srch_ns_<sig>\n");
         return;
     }
-    snprintf(srch_ns[i].sig, sizeof(srch_ns[i].sig), "%s", sig);
-    srch_ns[i].ns = ns;
-    if (i == n_srch_ns) n_srch_ns++;
+    if (i == n_srch_ns) {
+        snprintf(srch_ns[i].sig, sizeof(srch_ns[i].sig), "%s", sig);
+        srch_ns[i].ns = srch_ns[i].gpu_ns = 1.0;
+        n_srch_ns++;
+    }
+    if (gpu) srch_ns[i].gpu_ns = ns;
+    else srch_ns[i].ns = ns;
 }
 
 //------------------------------------------------------------------------------
@@ -2322,7 +2357,7 @@ void sdr_rcv_setopt(const char *opt, double value)
     extern double sdr_t_acq_ext, sdr_t_coh, sdr_thres_cn0_ext;
     extern double sdr_t_dll, sdr_b_dll, sdr_b_pll, sdr_b_fll_w, sdr_b_fll_n;
     extern double sdr_max_dop, sdr_dop_ctr, sdr_thres_cn0_l, sdr_thres_cn0_u, sdr_thres_pli;
-    extern int sdr_bump_jump, sdr_lost_th;
+    extern int sdr_bump_jump, sdr_lost_th, sdr_srch_gpu;
     if      (!strcmp(opt, "epoch"      )) sdr_epoch       = value;
     else if (!strcmp(opt, "lag_epoch"  )) sdr_lag_epoch   = value;
     else if (!strcmp(opt, "el_mask"    )) sdr_el_mask     = value;
@@ -2348,6 +2383,9 @@ void sdr_rcv_setopt(const char *opt, double value)
     else if (!strcmp(opt, "srch_budget")) sdr_srch_budget = value;
     else if (!strcmp(opt, "srch_budget_cold")) sdr_srch_budget_cold = value;
     else if (!strcmp(opt, "srch_nsat"  )) sdr_srch_nsat   = (int)value;
-    else if (!strncmp(opt, "srch_ns_", 8)) set_srch_ns(opt + 8, value);
+    else if (!strncmp(opt, "srch_ns_", 8)) set_srch_ns(opt + 8, value, 0);
+    else if (!strcmp(opt, "srch_gpu"   )) sdr_srch_gpu    = (int)value;
+    else if (!strcmp(opt, "srch_budget_gpu")) sdr_srch_budget_gpu = value;
+    else if (!strncmp(opt, "srch_gpu_ns_", 12)) set_srch_ns(opt + 12, value, 1);
     else fprintf(stderr, "sdr_rcv_setopt error opt=%s\n", opt);
 }

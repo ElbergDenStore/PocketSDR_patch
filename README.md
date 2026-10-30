@@ -21,6 +21,9 @@
 - Two search budgets (`srch_budget_cold` until `srch_nsat` satellites are locked).
 - The budget in cores: a search costs its nominal flop × `srch_ns_<sig>` (the host's CPU ns per flop, default 1),
   a signal starts searches until its share is spent, and `$LOG` records each search's thread CPU (`SEARCH CPU`).
+- Searches on a GPU through two hooks (`sdr_srch_gpu_take`, `sdr_srch_gpu_run`) that the application sets, used
+  with option `srch_gpu = 1`: a taken search runs once at the end of its integration, at the same data index; its
+  signal spends `srch_budget_gpu` at `srch_gpu_ns_<sig>`, and `$LOG` records `SEARCH GPU`.
 - Python modules load `libsdr.so`/`librtk.so` from `$POCKETSDR_LIB` if set.
 - `sdr_search_code()` FFTs the IF data once per search; each Doppler bin is a shift of its spectrum.
 - Lock-step searches: a round robin per signal, each with an equal share of the budget.

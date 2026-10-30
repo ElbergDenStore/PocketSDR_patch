@@ -183,7 +183,16 @@ typedef struct {                // signal acquisition type
     int fd_ext_n;               // number of Doppler bins for fd_ext (0=3)
     float *P_sum;               // sum of correlation powers
     int n_sum;                  // number of sum
+    int gpu;                    // Doppler step (FFT bins) of a GPU search (0:CPU)
+    float gpu_ms;               // last GPU search's GPU time (ms)
 } sdr_acq_t;
+
+typedef struct {                // GPU search result (sdr_corr_max's)
+    float P_max, P_ave;         // peak and mean correlation power
+    int ix[2];                  // peak's Doppler bin and code offset (samples)
+    float P_nb[3];              // powers at ix[1] in bins ix[0]-1..ix[0]+1
+    float ms;                   // the search's GPU time (ms)
+} sdr_srch_res_t;
 
 typedef struct {                // signal tracking type
     int npos, nposx;            // number of correlator positions
@@ -410,6 +419,7 @@ typedef struct sdr_rcv_tag {    // SDR receiver type
     int64_t srch_credit[SDR_MAX_NSIG]; // lock-step search budget credit per signal (CPU us)
     int srch_rr[SDR_MAX_NSIG];  // lock-step: last search without Doppler per signal
     int srch_act[SDR_MAX_NSIG]; // lock-step: signal searched or in debt at the last slot
+    int srch_gpu[SDR_MAX_NSIG]; // lock-step: signal's searches on the GPU budget
     int nsat_lock;              // lock-step: satellites locked at the last search sync
     int srch_cold;              // lock-step: the cold search budget applies
     sdr_thread_t thread;        // SDR receiver thread
@@ -571,6 +581,10 @@ sdr_ch_t *sdr_ch_new(const char *sig, int prn, double fs, double fi);
 void sdr_ch_free(sdr_ch_t *ch);
 void sdr_ch_update(sdr_ch_t *ch, double time, const sdr_buff_t *buff, int ix);
 void sdr_ch_set_corr(sdr_ch_t *ch, int nposx, double width);
+int sdr_ch_srch_gpu(const sdr_ch_t *ch);
+extern int (*sdr_srch_gpu_take)(const sdr_ch_t *ch, int M, int len_fds, int k);
+extern int (*sdr_srch_gpu_run)(const sdr_ch_t *ch, const sdr_buff_t *buff,
+    int ix, int M, const float *fds, int len_fds, int k, sdr_srch_res_t *res);
 int sdr_ch_corr_stat(sdr_ch_t *ch, double *stat, double *pos, sdr_cpx_t *C,
     double *P, double *I);
 int sdr_ch_corr_hist(sdr_ch_t *ch, double tspan, double *stat, sdr_cpx_t *P);
