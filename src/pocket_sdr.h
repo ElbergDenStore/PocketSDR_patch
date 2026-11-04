@@ -303,6 +303,8 @@ typedef struct {                // SDR receiver channel thread type
     int trace_state;            // CH state of open trace slice (0: none)
     double srch_mflop;          // nominal work of the running search (Mflop)
     double srch_cpu;            // its thread CPU time so far (s)
+    double trk_cpu;             // thread CPU time tracking since last log (s)
+    int64_t trk_n;              // IF data tracked since last log (cyc)
     int park;                   // lock-step: IDLE, waiting for a search start
     sdr_cond_t cond;            // lock-step: search start or stop
     struct sdr_rcv_tag *rcv;    // pointer to SDR receiver

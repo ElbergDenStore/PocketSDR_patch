@@ -620,6 +620,21 @@ static void log_srch_cpu(sdr_ch_th_t *th, double cpu)
     th->srch_cpu = 0.0;
 }
 
+// a tracking channel's thread CPU time: logged every TRK_LOG_CYC of data
+// tracked and when the lock ends, with the data it covers -------------------
+#define TRK_LOG_CYC 10000
+
+static void log_trk_cpu(sdr_ch_th_t *th, double cpu, int n)
+{
+    th->trk_cpu += sdr_cpu_time() - cpu;
+    th->trk_n += n;
+    if (th->ch->state == SDR_STATE_LOCK && th->trk_n < TRK_LOG_CYC) return;
+    sdr_log(3, "$LOG,%.3f,%s,%d,TRACK CPU (%.3f,%.3f)", th->ix * SDR_CYC,
+        th->ch->sig, th->ch->prn, th->trk_n * SDR_CYC, th->trk_cpu * 1e3);
+    th->trk_cpu = 0.0;
+    th->trk_n = 0;
+}
+
 // lock-step: report CH progress, then wait for new IF data. An IDLE CH parks
 // until its search starts, then skips to where it would have caught up --------
 static void wait_data_ls(sdr_ch_th_t *th, int n)
@@ -663,11 +678,13 @@ static void *ch_thread(void *arg)
             // update SDR receiver CH
             trace_ch_state(th);
             int srch = ch->state == SDR_STATE_SRCH;
+            int trk = ch->state == SDR_STATE_LOCK;
             if (srch && ch->acq->n_sum == 0) th->srch_mflop = srch_mflop(ch);
-            double cpu = srch ? sdr_cpu_time() : 0.0;
+            double cpu = srch || trk ? sdr_cpu_time() : 0.0;
             sdr_ch_update(ch, th->ix * SDR_CYC, th->rcv->buff[ch->rf_ch],
                 th->rcv->N * (int)(th->ix % MAX_BUFF));
             if (srch) log_srch_cpu(th, cpu);
+            if (trk) log_trk_cpu(th, cpu, n);
             trace_ch_state(th);
             
             // update navigation data
