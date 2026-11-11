@@ -38,8 +38,12 @@
 //  2026-07-19  1.25 add pre-combined E5ABQ replicas (a+b, a-b) to correlate
 //                   both sidebands in one pass once the polarity is calibrated
 //  2026-07-19  1.26 improve low-C/N0 acquisition and pilot tracking
-//  2026-10-30  1.27 searches on GPU hooks (option srch_gpu)
-//  2026-11-11  1.28 searches follow the code's drift (sdr_search_code_drift),
+//  2026-10-24  1.27 save the lock count at signal lost (ch->lost_lock) to
+//                   enable the Doppler-aided re-acquisition
+//  2026-10-25  1.28 carry over the decoded TOW and week across a
+//                   re-acquisition for fast re-fix (GLONASS FDMA excluded)
+//  2026-10-30  1.29 searches on GPU hooks (option srch_gpu)
+//  2026-11-11  1.30 searches follow the code's drift (sdr_search_code_drift),
 //                   option thres_cn0_l_<sig>
 //
 #include <ctype.h>
@@ -528,23 +532,71 @@ static void trk_init(sdr_trk_t *trk)
     memset(trk->aveI, 0, sizeof(double) * SDR_MAX_CORR);
 }
 
+// initial carrier NCO phase ----------------------------------------------------
+static double init_phi(double fi, double time)
+{
+    // phi = frac(fi * time) on the common receiver time origin to cancel the
+    // start-time dependent fractional carrier phase bias between CHs
+    // (time = cycle count * SDR_CYC; split the product to avoid precision
+    // loss for large time)
+    int64_t n = (int64_t)floor(time / SDR_CYC + 0.5);
+    int64_t s = n / 1000, r = n % 1000;
+    int64_t k = ((int64_t)floor(fi) * r) % 1000; // floor(fi) * s: integer
+    double fi_f = fi - floor(fi);
+    double phi = fi_f * s + (fi_f * r + k) * 1e-3;
+    return phi - floor(phi);
+}
+
+// carry over decoded TOW across a re-acquisition -------------------------------
+//   The frozen TOW is advanced by the receiver sample clock and snapped to the
+//   integer-ms grid, which resolves the code cycle ambiguity (error budget
+//   << 0.5 ms within SDR_TO_REACQ). The first frame decode confirms or rejects
+//   the carried TOW (update_tow()). GLONASS FDMA is excluded: the same FCN can
+//   be re-acquired from the antipodal satellite.
+static int carry_over_tow(sdr_ch_t *ch, double time, double coff)
+{
+    if (ch->tow_v != 1 || ch->tow < 0 || ch->week <= 0) return 0;
+    if (ch->lost_lock * ch->T < SDR_MIN_LOCK) return 0;
+    if (time < ch->time || time > ch->time + SDR_TO_REACQ) return 0;
+    if (!strcmp(ch->sig, "G1CA") || !strcmp(ch->sig, "G2CA")) return 0;
+
+    double tow = ch->tow * 1e-3 + (time - ch->time) + (coff - ch->coff);
+    int tow_ms = (int)floor(tow / 1e-3 + 0.5);
+    if (fabs(tow - tow_ms * 1e-3) > 0.35e-3) return 0; // snap residual
+    if (tow_ms >= 86400 * 7 * 1000) {
+        tow_ms -= 86400 * 7 * 1000;
+        ch->week++;
+    }
+    ch->tow = tow_ms;
+    ch->tow_pred = 1;
+    sdr_log(3, "$LOG,%.3f,%s,%s,%d,TOW CARRY OVER (%.3f)", time, ch->sat,
+        ch->sig, ch->prn, tow_ms * 1e-3);
+    return 1;
+}
+
 // start tracking --------------------------------------------------------------
 static void start_track(sdr_ch_t *ch, double time, double fd, double coff,
     double cn0)
 {
+    int carry = carry_over_tow(ch, time, coff);
+
     ch->state = SDR_STATE_LOCK;
     ch->time = time;
     ch->lock = 0;
     ch->fd = fd;
     ch->coff = coff;
-    ch->phi = ch->adr = 0.0;
+    ch->phi = init_phi(ch->fi, time);
+    ch->adr = 0.0;
     ch->cn0 = cn0;
     ch->pli = 1.0;
     ch->lost_cnt = 0;
     ch->pli_valid = 0;
-    ch->week = 0;
-    ch->tow = -1;
-    ch->tow_v = 0;
+    if (!carry) {
+        ch->week = 0;
+        ch->tow = -1;
+        ch->tow_v = 0;
+        ch->tow_pred = 0;
+    }
     trk_init(ch->trk);
     sdr_nav_init(ch->nav);
 }
@@ -902,6 +954,7 @@ static void test_lost(sdr_ch_t *ch)
     if (ch->lost_cnt < sdr_lost_th) return;
     
     ch->state = SDR_STATE_IDLE;
+    ch->lost_lock = ch->lock;
     ch->lock = 0;
     ch->trk->sec_sync = ch->trk->sec_pol = 0;
     ch->nav->ssync = ch->nav->fsync = ch->nav->rev = 0;
@@ -964,7 +1017,16 @@ static int CSK(sdr_ch_t *ch, const sdr_cpx16_t *IQ, double coff_frc)
 static void update_tow(sdr_ch_t *ch, double sec)
 {
     if (ch->tow < 0) return;
-    ch->tow = (ch->tow + (int)floor(sec / 1e-3 + 0.5)) % (86400 * 7 * 1000);
+    ch->tow += (int)floor(sec / 1e-3 + 0.5);
+    
+    // the week has to follow the TOW rollover until the next week is decoded
+    if (ch->tow >= 86400 * 7 * 1000) {
+        ch->tow -= 86400 * 7 * 1000;
+        if (ch->week > 0) ch->week++;
+    } else if (ch->tow < 0) {
+        ch->tow += 86400 * 7 * 1000;
+        if (ch->week > 0) ch->week--;
+    }
 }
 
 // adjust code offset (0 <= ch->coff < ch->T) ----------------------------------

@@ -1,7 +1,7 @@
 # Pocket SDR C Library API Reference
 
 <div style="text-align: right;">
-<strong>ver.0.20  2026-08-07</strong>
+<strong>ver.0.21  2026-10-21</strong>
 </div>
 
 ---
@@ -212,7 +212,7 @@ This API reference describes the **Pocket SDR** C library (`libsdr`). The librar
 <br><br>
 
 - `sdr_pvt_t`
-  - PVT state: epoch and cycle index, satellite count, RTKLIB `obs_t`/`nav_t`/`sol_t`/`ssat_t`/`rtcm_t`, latency, sol/obs/nav counters, back-pointer to receiver, and the latest FIX position / receiver clock bias / receiver clock drift rate used by fast acquisition and persisted in `.pocket_navdata.csv`.
+  - PVT state: epoch and cycle index, receiver sync mode (`SDR_SYNC_UNKNOWN` / `SDR_SYNC_COARSE` / `SDR_SYNC_FINE`), satellite count, RTKLIB `obs_t`/`nav_t`/`sol_t`/`ssat_t`/`rtcm_t`, latency, sol/obs/nav counters, back-pointer to receiver, and the latest FIX position / receiver clock bias / receiver clock drift rate used by fast acquisition and persisted in `.pocket_navdata.csv`.
 <br><br>
 
 - `sdr_rfch_t`
@@ -497,17 +497,35 @@ Generic SDR front-end via SoapySDR. Compiled in when `-DSOAPYSDR` is set. Suppor
 - **Return**: number of devices found
 <br><br>
 
-**`sdr_sdev_t *sdr_sdev_open(const char *driver, int fmt, double rate, double freq, double bw, double gain)`**
+**`sdr_sdev_t *sdr_sdev_open(const char *driver, int fmt, double rate, const double *freq, const char *opt)`**
 <br>
-- **Description**: Open a SoapySDR device.
+- **Description**: Open one or more SoapySDR devices as a single multi-channel
+  device. With multiple devices the external clock and time sources are
+  selected and the streams are started at a common time latched by a 1PPS, so
+  that the RF channels are aligned in samples, unless `-NO_SYNC` is given.
 - **Arguments**:
-  - driver: SoapySDR driver string (e.g., "lime", "rtlsdr")
-  - fmt: IF data format (`SDR_FMT_*`)
+  - driver: SoapySDR driver string (e.g., "lime", "rtlsdr"), or device specs
+    separated by `;`. A spec may be a SoapySDR key-value string, where the
+    Pocket SDR extension key `nchan=<n>` selects the number of RX channels of
+    the device (default 1). The total number of RF channels has to be
+    `SDR_MAX_RFCH` or less.
+    - `"driver=uhd,serial=1;driver=uhd,serial=2"`: 2 devices of 1 CH each
+    - `"driver=uhd,serial=1,nchan=2"`: 1 device of 2 CHs
+  - fmt: IF data format (`SDR_FMT_CS8` or `SDR_FMT_CS16`)
   - rate: sampling rate (sps)
-  - freq: center frequency (Hz)
-  - bw: analog filter bandwidth (Hz, ≤ 0: default)
-  - gain: front-end gain (dB, ≤ 0: AGC)
-- **Return**: device handle (NULL: error)
+  - freq: center frequency for each RF CH (Hz) (freq[i] ≤ 0: same as freq[0])
+  - opt: device options separated by spaces
+    - `-BW=<bw>`: analog filter bandwidth (MHz) (omitted: driver default)
+    - `-GAIN=<gain>`: front-end gain (dB) (omitted: AGC)
+    - `-EXT_CLOCK`: select the external clock source
+    - `-NO_SYNC`: no device time sync by 1PPS. The devices run on their own
+      clocks and the RF channels of different devices are NOT aligned in
+      samples (for non-coherent uses such as a band per device)
+    - `-GPIO=<val>`: output `<val>` (0-255) to the GPIO pins (USRP: front-panel
+      GPIO bank `FP0`; other drivers: the first GPIO bank). The pins are set
+      to outputs at the device open, since UHD resets them at every open.
+- **Return**: device handle (NULL: error). The number of RF channels opened is
+  in the `nch` member.
 <br><br>
 
 **`void sdr_sdev_close(sdr_sdev_t *sdev)`**
@@ -517,7 +535,10 @@ Generic SDR front-end via SoapySDR. Compiled in when `-DSOAPYSDR` is set. Suppor
 
 **`int sdr_sdev_start(sdr_sdev_t *sdev)`**
 <br>
-- **Description**: Activate the stream and start the reading thread.
+- **Description**: Activate the streams and start the reading threads. With the
+  device time sync, all the streams are started at a common time latched by a
+  1PPS. A multi-channel stream of a device is started at a time of the device
+  in any case, as UHD requires it to align the channels.
 - **Return**: 1 on success, 0 on error
 <br><br>
 
@@ -527,10 +548,29 @@ Generic SDR front-end via SoapySDR. Compiled in when `-DSOAPYSDR` is set. Suppor
 - **Return**: 1 on success, 0 on error
 <br><br>
 
-**`int sdr_sdev_read(sdr_sdev_t *sdev, uint8_t *buff, int size)`**
+**`int sdr_sdev_read(sdr_sdev_t *sdev, uint8_t **buff, int size)`**
 <br>
-- **Description**: Copy up to `size` bytes of IF data from the internal ring buffer.
-- **Return**: number of bytes copied
+- **Description**: Copy `size` bytes of IF data of each RF CH from the internal
+  ring buffers into `buff[0]` ... `buff[nch-1]`. All the RF channels are read at
+  the same sample position, so the data are aligned in samples.
+- **Arguments**:
+  - buff: IF data buffer of each RF CH (`buff[nch]`)
+  - size: IF data buffer size of a RF CH (bytes)
+- **Return**: number of bytes copied for a RF CH (0: no data, -1: error)
+<br><br>
+
+**`int sdr_sdev_sensor(sdr_sdev_t *sdev, int ch, const char *name, double *value)`**
+<br>
+- **Description**: Read a sensor of a RF channel, such as `temp`, `rssi` or
+  `lo_locked` of a USRP. If the name is not a RF channel sensor, a sensor of
+  the device (mboard) of the RF channel, such as `ref_locked`, is read instead.
+  The sensor names are as defined by the device driver. A boolean sensor is
+  read as 1 or 0.
+- **Arguments**:
+  - ch: RF channel index (0 to nch-1)
+  - name: sensor name
+  - value: sensor value
+- **Return**: 1 on success, 0 if the device has no such sensor
 <br><br>
 
 
@@ -571,7 +611,7 @@ Read and write Pocket SDR FE register configuration files (MAX2771 / FX2LP / FX3
 ---
 
 ### Overview
-General DSP and bookkeeping helpers: complex/FFT primitives, IF buffer / file I/O, code search and tracking correlators (scalar + AVX2 paths), Doppler bin generation, PSD utilities, log streams, packed-bit accumulators, and the digital LPF.
+General DSP and bookkeeping helpers: complex/FFT primitives, IF buffer / file I/O, code search and tracking correlators (scalar + AVX2 / AVX-512 paths), Doppler bin generation, PSD utilities, log streams, packed-bit accumulators, and the digital LPF.
 <br>
 
 ### API Functions
@@ -639,16 +679,24 @@ General DSP and bookkeeping helpers: complex/FFT primitives, IF buffer / file I/
 - **Return**: filled `sdr_buff_t` (NULL: error)
 <br><br>
 
-**`int sdr_tag_write(const char *file, const char *prog, gtime_t time, int fmt, double fs, const double *fo, const int *IQ, const int *bits)`**
+**`int sdr_tag_write(const char *file, const char *prog, gtime_t time, int fmt, int nch, double fs, const double *fo, const int *IQ, const int *bits)`**
 <br>
-- **Description**: Write a `<file>.tag` companion file describing IF data parameters.
+- **Description**: Write a `<file>.tag` companion file describing IF data
+  parameters. `nch` (≤ 0: as defined by `fmt`) is written as `NCH`. If `nch`
+  exceeds the number of RF channels defined by `fmt`, the IF data file is a
+  sequence of channel-planar blocks of `SDR_CYC` each, and `T_CYC` is also
+  written so that a replay with a different processing cycle is rejected.
 - **Return**: 1 on success, 0 on error
 <br><br>
 
-**`int sdr_tag_read(const char *file, char *prog, gtime_t *time, int *fmt, double *fs, double *fo, int *IQ, int *bits)`**
+**`int sdr_tag_read(const char *file, char *prog, gtime_t *time, int *fmt, int *nch, double *fs, double *fo, int *IQ, int *bits)`**
 <br>
-- **Description**: Read a `<file>.tag` companion file. Output pointers may be NULL to skip.
-- **Return**: 1 on success, 0 on error / no tag
+- **Description**: Read a `<file>.tag` companion file. Output pointers may be
+  NULL to skip. `nch` falls back to the number of RF channels defined by `fmt`
+  when the tag file has no `NCH`, so tag files written by earlier versions are
+  read as before.
+- **Return**: 1 on success, 0 on no readable tag file, -1 if the IF data cannot
+  be used (`T_CYC` does not match `SDR_CYC`)
 <br><br>
 
 **`void sdr_search_code(const sdr_cpx_t *code_fft, double T, const sdr_buff_t *buff, int ix, int N, double fs, double fi, const float *fds, int len_fds, float *P)`**
@@ -696,14 +744,14 @@ General DSP and bookkeeping helpers: complex/FFT primitives, IF buffer / file I/
 - **Return**: heap-allocated float array (free with `sdr_free()`)
 <br><br>
 
-**`void sdr_corr_std(const sdr_buff_t *buff, int ix, int N, double fs, double fc, double phi, const int8_t *code, double coff, const double *pos, int n, int pol, sdr_cpx_t *corr, sdr_cpx_t *C)`**
+**`void sdr_corr_std(const sdr_buff_t *buff, int ix, int N, double fs, double fc, double phi, const int8_t *code, const int32_t *code_sum, const int8_t *code_Q, const int32_t *code_sum_Q, int scale, double coff, const double *pos, int n, int pol, sdr_cpx_t *corr, sdr_cpx_t *C)`**
 <br>
-- **Description**: Standard time-domain correlator with fused carrier wipeoff. Mixes the carrier (`fc`, `phi`) and correlates against the real-code replicas in a single chunked pass over `buff[ix..ix+N)`, without an intermediate baseband buffer. `code` is the resampled code bank (`N x SDR_N_CODES`, `int8_t` values -1/0/1, I=Q implied). Writes `n` correlations to `corr` and the pre/post code-wrap prompt correlations to `C[0..1]` (bit-transition handling). `pol` selects the code polarity handling over the wrap-around: 0 detects a data-bit flip (normal tracking), 1 assumes fixed polarity (symbol-aligned circular window, e.g. L6 CSK).
+- **Description**: Standard time-domain correlator with fused carrier wipeoff. Mixes the carrier (`fc`, `phi`) and correlates against the code replicas in a single chunked pass over `buff[ix..ix+N)`, without an intermediate baseband buffer. `code` is the resampled code bank (`N x SDR_N_CODES`, `int8_t` values, I=Q implied) and `code_sum` its prefix sums (`(N+1) x SDR_N_CODES`, used to remove the +128 data bias of the uint8 x int8 inner products). `code_Q` / `code_sum_Q` are the imaginary code bank for complex replicas (NULL for a real code); with them the correlation is `sum(IQ * conj(code + j*code_Q))`. `scale` is the code amplitude scale (1 for -1/0/+1 codes); correlations are normalized by it. Writes `n` correlations to `corr` and the pre/post code-wrap prompt correlations to `C[0..1]` (bit-transition handling). `pol` selects the code polarity handling over the wrap-around: 0 detects a data-bit flip (normal tracking), +1/-1 assumes fixed polarity (symbol-aligned circular window, e.g. L6 CSK).
 <br><br>
 
-**`void sdr_corr_std_cpx_code(const sdr_cpx16_t *IQ, const sdr_cpx16_t *code, int N, double coff, const double *pos, int n, sdr_cpx_t *corr, sdr_cpx_t *C)`**
+**`void sdr_corr_std2(const sdr_buff_t *buff, int ix, int N, double fs, double fc, double phi, const int8_t *code, const int32_t *code_sum, const int8_t *code_Q, const int32_t *code_sum_Q, const int8_t *code2, const int32_t *code2_sum, const int8_t *code2_Q, const int32_t *code2_sum_Q, int scale, double coff, const double *pos, int n, int pol, sdr_cpx_t *corr, sdr_cpx_t *C)`**
 <br>
-- **Description**: Time-domain correlator with complex code (`sdr_cpx16_t` replicas, E5ABQ) on IF-carrier-mixed samples.
+- **Description**: `sdr_corr_std()` with separate code banks for the part after the code wrap-around: `code2*` (NULL = same as `code*`) allow a replica whose sideband combination sign differs across the wrap-around, which `pol` cannot express (E5 AltBOC a/b combining).
 <br><br>
 
 **`void sdr_corr_std_cpx(const sdr_cpx_t *buff, int len_buff, int ix, int N, double fs, double fc, double phi, const float *code, const double *pos, int n, sdr_cpx_t *corr)`**
@@ -1292,25 +1340,30 @@ Top-level receiver lifecycle and state queries. A receiver wraps a front-end (US
 
 `sdr_rcv_open_*` and `sdr_rcv_new` take an `opt` string with space-separated tokens:
 
-- `-RFCH <sig>:<ch>[{,|-}<ch>...]` — assign a signal to specific RF CH(s).
+- `-RFCH <sig>:<ch>[{,|-}<ch>...]` — assign a signal to specific RF CH(s). Array CHs (`nrfch+1`..`nrfch+narch`) can be assigned as well.
 - `-LPF=<rfch>:<MHz>[,<rfch>:<MHz>...]` — enable digital LPF on RF CH(s) (two-sided BW in MHz). Real-sampling RF CHs (`IQ=1`) are auto-LPFed at 0.9·fs/2 even without this option.
 - `-ARCH=<nch>` — number of antenna-array channels.
 - `-ARRAY` — output one RTCM3 obs stream per array element (station ID = CH).
 - `-SCALE=<scale>` — raw-to-IF LUT scale for INT8 / CS8 / CS16 formats (0 enables AGC; default 1.0).
 - `-TRACE[=<level>]` — enable debug trace logging at `<level>`.
-- `-FAST_SRCH` — enable fast acquisition. The receiver predicts initial Doppler
+- `-FAST_SRCH` — enable fast acquisition (the `fast_acq` key of
+  `sdr_rcv_setopt()` enables it as well). The receiver predicts initial Doppler
   from `.pocket_navdata.csv` navigation/almanac data plus the last FIX position
-  and receiver clock drift rate; the saved position is ignored if its timestamp
-  differs from the current GPST by more than one day.
+  and receiver clock drift rate, at the receiver time. Until the receiver sync
+  mode becomes coarse (the epoch time set by the TOW/WN of a received signal)
+  the signals are acquired by the full search; the fine mode follows the first
+  PVT fix. The last FIX position is inherited regardless of its timestamp.
 - `-GAIN=<dB>` / `-BW=<MHz>` — SoapySDR gain and analog bandwidth options
   passed through `sdr_rcv_open_sdev()`.
 - `-E5AB_OFF=<ns>` — Galileo E5AltBOC code offset correction.
 - `-BUMP_K=<value>` — BOC bump-jump discriminator parameter.
+- `-SENS=<name>[,<name>...]` — sensors of the RF channels logged as
+  `$SENS,<time>,<rfch>,<name>,<value>` every 10 s (default: `temp`).
 <br>
 
 ### API Functions
 
-**`sdr_rcv_t *sdr_rcv_new(const char **sigs, const int *prns, int n, int fmt, double fs, const double *fo, const int *IQ, const int *bits, const char *opt)`**
+**`sdr_rcv_t *sdr_rcv_new(const char **sigs, const int *prns, int n, int fmt, int nrfch, double fs, const double *fo, const int *IQ, const int *bits, const char *opt)`**
 <br>
 - **Description**: Allocate and initialize a receiver with `n` (signal, PRN) pairs, IF data format, and per-RF-CH parameters.
 - **Arguments**:
@@ -1318,14 +1371,19 @@ Top-level receiver lifecycle and state queries. A receiver wraps a front-end (US
   - prns: array of PRN numbers (length `n`)
   - n: number of (sig, prn) pairs
   - fmt: IF data format (`SDR_FMT_*`)
+  - nrfch: number of RF CHs (≤ 0: as defined by `fmt`)
   - fs: sampling rate (sps)
-  - fo: per-RF-CH LO frequencies (length ≥ number of RF CHs in `fmt`)
+  - fo: per-RF-CH LO frequencies (length ≥ number of RF CHs)
   - IQ: per-RF-CH sampling type (1=I, 2=IQ)
   - bits: per-RF-CH sample bit width
   - opt: receiver options string
 - **Return**: receiver pointer (NULL: error)
 - **Notes**:
   - Sets up `sdr_rfch_t[]`, IF buffers, channel threads, PVT, and (if `-ARCH` ≥ 1) `sdr_array_t`. Use `sdr_rcv_open_*` for the common combined-allocate-and-start path.
+  - A single-RF-CH format (`CS8` or `CS16`) with `nrfch` ≥ 2 means the raw IF
+    data carries the RF CHs as channel-planar blocks of a processing cycle,
+    while a multi-CH format (`RAW8` / `RAW16` / `RAW16I` / `RAW32`) carries them
+    interleaved in a sample.
 <br><br>
 
 **`void sdr_rcv_free(sdr_rcv_t *rcv)`**
@@ -1362,9 +1420,15 @@ Top-level receiver lifecycle and state queries. A receiver wraps a front-end (US
 - **Return**: receiver pointer (NULL: error)
 <br><br>
 
-**`sdr_rcv_t *sdr_rcv_open_sdev(const char **sigs, int *prns, int n, const char *driver, int fmt, double rate, double freq, const int *types, const char **paths, const char *opt)`**
+**`sdr_rcv_t *sdr_rcv_open_sdev(const char **sigs, int *prns, int n, const char *driver, int fmt, double rate, const double *fo, const int *types, const char **paths, const char *opt)`**
 <br>
-- **Description**: Open a SoapySDR device and start a receiver.
+- **Description**: Open one or more SoapySDR devices and start a receiver. The
+  number of RF CHs of the receiver is the total number of RF CHs opened.
+- **Arguments**:
+  - driver: SoapySDR driver or device specs (see `sdr_sdev_open()`)
+  - fo: center frequency for each RF CH (Hz) (fo[i] ≤ 0: same as fo[0])
+  - other arguments as in `sdr_rcv_new()`
+- **Return**: receiver pointer (NULL: error)
 <br><br>
 
 **`sdr_rcv_t *sdr_rcv_open_file(const char **sigs, int *prns, int n, int fmt, double fs, const double *fo, const int *IQ, const int *bits, double toff, double tscale, const char *file, const int *types, const char **paths, const char *opt)`**
@@ -1388,7 +1452,7 @@ Top-level receiver lifecycle and state queries. A receiver wraps a front-end (US
   `epoch`, `lag_epoch`, `el_mask`, `sp_corr`, `t_acq`, `t_acq_ext`, `t_coh`,
   `t_dll`, `b_dll`, `b_pll`, `b_fll_w`, `b_fll_n`, `max_dop`,
   `thres_cn0_l`, `thres_cn0_ext`, `thres_cn0_u`, `thres_pli`, `lost_th`,
-  `bump_jump`, and `max_acq`.
+  `bump_jump`, `max_acq`, and `fast_acq`.
 - **Notes**:
   - `t_acq_ext` controls assisted-acquisition integration; `t_coh` requests the coherent PLL update interval for synchronized pilot signals; `thres_cn0_ext` is the assisted-acquisition threshold before applying the tracking-loss-plus-1-dB floor.
   - `t_acq_ext`, `t_coh`, and `thres_cn0_ext` accept only values greater than zero. An invalid or unknown key prints an error and leaves the current value unchanged.
@@ -1450,6 +1514,18 @@ Top-level receiver lifecycle and state queries. A receiver wraps a front-end (US
 <br>
 - **Description**: Snapshot per-RF-CH (or per-array-CH) status into `stat[0..7]` = {dev, fmt, fs, fo, IQ, bits, std-dev, rtoc-flag}. `ch` is 1-indexed (1..nrfch+narch).
 - **Return**: 1 on success, 0 on error
+<br><br>
+
+**`int sdr_rcv_rfch_sensor(sdr_rcv_t *rcv, int ch, const char *name, double *value)`**
+<br>
+- **Description**: Read a sensor of a RF channel of the SDR device (see
+  `sdr_sdev_sensor()`). Pocket SDR FE, file and stream inputs have no sensors.
+- **Arguments**:
+  - ch: RF channel number (1 to nrfch)
+  - name: sensor name as defined by the device (`temp`, `rssi`, `lo_locked`,
+    `ref_locked`, ...)
+  - value: sensor value (a boolean sensor as 1 or 0)
+- **Return**: 1 on success, 0 if no such sensor
 <br><br>
 
 **`int sdr_rcv_rfch_psd(sdr_rcv_t *rcv, int ch, double tave, int N, float *psd)`**

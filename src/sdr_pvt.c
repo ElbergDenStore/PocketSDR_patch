@@ -14,6 +14,10 @@
 //  2026-07-17  1.2  widen pseudorange lower bound for GEO/IGSO epoch seeding
 //                   add nav data consistency tests
 //  2026-07-24  1.3  output NMEA and RTCM3 to multiple streams
+//  2026-09-28  1.4  add receiver sync mode (unknown, coarse, fine)
+//  2026-10-25  1.5  accept observation data of the channels with the TOW
+//                   carried over a re-acquisition
+//                   inherit the last fix position regardless of the CPU time
 //
 #include "pocket_sdr.h"
 
@@ -25,7 +29,6 @@
 #define STD_ERR        0.015    // std-dev of carrier phase noise (m)
 #define FILE_NAV       ".pocket_navdata.csv" // navigation data file
 #define MAXDTGLO       (86400.0*7.0) // max age of GLONASS almanac (s)
-#define MAXDTPOS       86400.0   // max age of last fix position (s)
 
 #define ROUND(x)   (int)floor((x) + 0.5)
 #define SQRT(x)    ((x) > 0.0 ? sqrt(x) : 0.0)
@@ -657,21 +660,19 @@ static void load_navdata(const char *file, nav_t *nav, sdr_pvt_t *pvt)
             long t;
             double sec, rr[3], dtr, dtrd;
             gtime_t time;
+            // inherit the last fix regardless of the CPU time: the signal time
+            // of a GNSS simulator or a replayed IF data is not the CPU time
             if (sscanf(buff + 4, "%ld,%lf,%lf,%lf,%lf,%lf,%lf", &t, &sec,
                 rr, rr+1, rr+2, &dtr, &dtrd) == 7) {
                 time.time = t;
                 time.sec  = sec;
-                if (fabs(timediff(utc2gpst(timeget()), time)) < MAXDTPOS) {
-                    pvt->last_time  = time;
-                    pvt->last_rr[0] = rr[0];
-                    pvt->last_rr[1] = rr[1];
-                    pvt->last_rr[2] = rr[2];
-                    pvt->last_dtr   = dtr;
-                    pvt->last_dtrd  = dtrd;
-                    pvt->last_valid = 1;
-                } else {
-                    pvt->last_valid = 0;
-                }
+                pvt->last_time  = time;
+                pvt->last_rr[0] = rr[0];
+                pvt->last_rr[1] = rr[1];
+                pvt->last_rr[2] = rr[2];
+                pvt->last_dtr   = dtr;
+                pvt->last_dtrd  = dtrd;
+                pvt->last_valid = 1;
             }
         }
     }
@@ -731,6 +732,7 @@ void sdr_pvt_free(sdr_pvt_t *pvt)
     sdr_free(pvt->nav->eph);
     sdr_free(pvt->nav->geph);
     sdr_free(pvt->nav->seph);
+    sdr_free(pvt->nav->alm);
     sdr_free(pvt->nav);
     sdr_free(pvt->sol);
     sdr_free(pvt->ssat);
@@ -739,14 +741,34 @@ void sdr_pvt_free(sdr_pvt_t *pvt)
     sdr_free(pvt);
 }
 
+// set receiver sync mode ------------------------------------------------------
+static void set_sync(sdr_pvt_t *pvt, int sync, double time, const char *sig,
+    int prn)
+{
+    static const char *str[] = {"UNKNOWN", "COARSE", "FINE"};
+    
+    if (pvt->sync == sync) return;
+    pvt->sync = sync;
+    sdr_log(3, "$LOG,%.3f,%s,%d,RECEIVER SYNC %s", time, sig, prn, str[sync]);
+}
+
 // initialize epoch time and cycle ---------------------------------------------
 static void init_epoch(sdr_pvt_t *pvt, int64_t ix, sdr_ch_t *ch)
 {
     if (!ch->week) return;
+
+    // a wrong week is baked into pvt->time and never revised, so seed the epoch
+    // only from a week corroborated by another channel or by a repeated decode
+    if (ch->nav->week_n < 2 && (pvt->week_c != ch->week || pvt->ch_c == ch->no)) {
+        pvt->week_c = ch->week;
+        pvt->ch_c = ch->no;
+        return;
+    }
     double tow = floor(ch->tow * 1e-3 / sdr_epoch) * sdr_epoch + sdr_epoch;
     pvt->time = gpst2time(ch->week, tow);
     pvt->ix = ix + ROUND((tow - ch->tow * 1e-3 - 0.07) / SDR_CYC);
     pvt->ix = (pvt->ix / 20) * 20; // round by 20 ms
+    set_sync(pvt, SDR_SYNC_COARSE, ch->time, ch->sig, ch->prn);
 }
 
 // generate pseudorange --------------------------------------------------------
@@ -756,7 +778,12 @@ static double gen_prng(gtime_t time, const sdr_ch_t *ch)
     double tau = 0.0, tow = time2gpst(time, &week);
     
     if (ch->week > 0) {
-        tau = (week - ch->week) * 86400.0 * 7 + tow - ch->tow * 1e-3 + ch->coff;
+        // wrap the TOW difference instead of using ch->week: the epoch and the
+        // channel TOW straddle the end of week for a moment at the rollover
+        tau = tow - ch->tow * 1e-3;
+        if (tau > 302400.0) tau -= 86400.0 * 7;
+        else if (tau < -302400.0) tau += 86400.0 * 7;
+        tau += ch->coff;
     } else if (ch->tow_v == 2) { // resolve 100 ms ambiguity (0.05 <= tau < 0.15)
         tau = tow - ch->tow * 1e-3 + ch->coff + ch->nav->coff;
         tau -= floor(tau / 0.1) * 0.1;
@@ -861,7 +888,7 @@ void sdr_pvt_udobs(sdr_pvt_t *pvt, int64_t ix, sdr_ch_t *ch)
     }
     if (pvt->ix > 0 && ix == pvt->ix) { // update observation data
         if (ch->state == SDR_STATE_LOCK && ch->tow >= 0 && ch->tow_v > 0 &&
-            (ch->nav->fsync > 0 || ch->trk->sec_sync > 0)) {
+            (ch->nav->fsync > 0 || ch->trk->sec_sync > 0 || ch->tow_pred)) {
             update_obs(pvt->time, pvt->obs, ch);
         }
         pvt->nch++;
@@ -914,6 +941,21 @@ static int test_match_eph(eph_t *eph1, const eph_t *eph2)
     }
 }
 
+// rebase ephemeris week onto signal-derived channel week ----------------------
+static void rebase_eph_week(const sdr_ch_t *ch, eph_t *eph)
+{
+    int dw = ch->week - eph->week;
+
+    if (ch->week <= 0) return;
+    // era shift in 1024-week units keeps the half-week crossover adjustment
+    dw = (dw >= 0 ? dw + 512 : dw - 512) / 1024 * 1024;
+    if (dw == 0) return;
+    eph->week += dw;
+    eph->toe = timeadd(eph->toe, 604800.0 * dw);
+    eph->toc = timeadd(eph->toc, 604800.0 * dw);
+    eph->ttr = timeadd(eph->ttr, 604800.0 * dw);
+}
+
 //------------------------------------------------------------------------------
 //  Update navigation data.
 //
@@ -946,6 +988,7 @@ void sdr_pvt_udnav(sdr_pvt_t *pvt, sdr_ch_t *ch)
         if (ch->nav->type == 3 &&
             decode_frame(data, pvt->nav->eph + sat - 1, NULL, NULL, NULL)) {
             pvt->nav->eph[sat-1].sat = sat;
+            rebase_eph_week(ch, pvt->nav->eph + sat - 1);
             out_log_eph(ch->time, ch->sat, ch->sig, pvt->nav->eph + sat - 1);
             out_rtcm3_nav(pvt->rtcm, sat, 0, pvt->nav, pvt->rcv);
             pvt->count[2]++;
@@ -1104,6 +1147,9 @@ static void update_sol(sdr_pvt_t *pvt)
     // point positioning with L1 pseudorange
     if (pntpos(obs, nobs, pvt->nav, &opt, pvt->sol, NULL, pvt->ssat, msg)) {
         
+        // update satellite az/el angles (incl. unhealthy satellites)
+        update_azel(pvt->nav, pvt->sol, pvt->ssat);
+        
         // correct solution time
         corr_sol_time(pvt->sol);
         
@@ -1115,7 +1161,7 @@ static void update_sol(sdr_pvt_t *pvt)
         pvt->last_dtr   = pvt->sol->dtr[0];
         pvt->last_dtrd  = pvt->sol->dtr[5];   // clock drift rate (s/s)
         pvt->last_valid = 1;
-        pvt->last_ix    = pvt->ix;
+        set_sync(pvt, SDR_SYNC_FINE, time, "", 0);
         
         // output log $POS and NMEA RMC, GGA, GSA and GSV
         out_log_pos(time, pvt->sol, pvt->obs->n);

@@ -1,7 +1,7 @@
 # Pocket SDR Command Reference
 
 <div style="text-align: right;">
-<strong>ver.0.20  2026-08-07</strong>
+<strong>ver.0.21  2026-10-21</strong>
 </div>
 
 ---
@@ -179,8 +179,8 @@ Hexadecimal form:
 
 ```
 pocket_dump [-t tsec] [-r] [-p bus[,port]] [-c conf_file] [-q] [-v]
-            [-driver name] [-fmt {CS8|CS16}] [-f fs] [-fo freq]
-            [-gain gain] [-bw bw]
+            [-driver name] [-fmt {CS8|CS16}] [-f fs] [-fo freq[,...]]
+            [-gain gain] [-bw bw] [-gpio val] [-NO_SYNC]
             [path [path ...]]
 ```
 
@@ -189,7 +189,9 @@ pocket_dump [-t tsec] [-r] [-p bus[,port]] [-c conf_file] [-q] [-v]
 Capture and dump digital IF (DIF) data from a Pocket SDR FE device or a
 SoapySDR-supported device. Pocket SDR FE capture writes one output file per RF
 channel unless `-r` is specified. SoapySDR capture writes one complex sample
-stream to the first output path. Capturing stops on the configured duration
+stream to the first output path; with multiple RF channels the channels are
+written channel-planar in blocks of a processing cycle, which `pocket_trk`
+replays as a multi-channel input. Capturing stops on the configured duration
 (`-t`), or by Ctrl-C. A `<path>.tag` companion file is written for each output,
 recording the IF format, sampling rate, LO frequencies, and per-CH sampling type
 / bit width so downstream tools (e.g. `pocket_trk`, `pocket_acq`) can
@@ -208,19 +210,34 @@ auto-configure.
 - `-driver name`
   - Use a SoapySDR device instead of a Pocket SDR FE device. Examples: `lime`,
     `uhd`, `bladerf`, `rtlsdr`, `plutosdr`. Driver-specific arguments accepted
-    by SoapySDR can also be passed.
+    by SoapySDR can also be passed. Multiple devices are specified as specs
+    separated by `;`, and `nchan=<n>` in a spec selects the number of RX
+    channels of the device (default 1), up to 8 RF channels in total.
+    With multiple devices the external clock and time sources are selected and
+    the streams are started at a common time latched by a 1PPS, so a common
+    10 MHz and 1PPS have to be distributed to the devices.
+    - `-driver "driver=uhd,serial=31A1;driver=uhd,serial=31B5"`
+    - `-driver "driver=uhd,serial=31A1,nchan=2"`
 - `-fmt {CS8|CS16}`
   - SoapySDR sample format. [`CS8`]
 - `-f fs`
   - SoapySDR sampling rate in MHz. [`12`]
-- `-fo freq`
-  - SoapySDR RF center frequency in MHz. This option is required with
-    `-driver`.
+- `-fo freq[,...]`
+  - SoapySDR RF center frequency of each RF channel in MHz. This option is
+    required with `-driver`. A channel with an omitted or `0` frequency uses
+    the frequency of the first channel.
 - `-gain gain`
   - SoapySDR RF gain in dB. Omitted or `0`: use automatic gain if the driver
     supports it.
 - `-bw bw`
   - SoapySDR RF bandwidth in MHz. Omitted or `0`: leave driver default.
+- `-gpio val`
+  - Output `val` (0-255) to the GPIO pins of the SoapySDR device (USRP:
+    front-panel GPIO). The pins are set to outputs at the device open.
+- `-NO_SYNC`
+  - With multiple SoapySDR devices, do not synchronize the device times by a
+    1PPS. The devices run on their own clocks and the RF channels of
+    different devices are NOT aligned in samples.
 - `-q`
   - Suppress the runtime status display.
 - `-v`
@@ -305,9 +322,9 @@ pocket_trk [-sig sig -prn prn[,...] [-rfch ch[,...]] ...]
            [-f freq] [-fo freq[,...]] [-IQ {1|2}[,...]] [-bits {2|3}[,...]]
            [-toff toff] [-tscale scale] [-ti tint]
            [-p bus[,port]] [-c conf_file]
-           [-driver name] [-gain gain] [-bw bw] [-fd dopp]
-           [-log path] [-nmea path] [-rtcm path] [-raw path] ...
-           [-arch nch] [-geom file] [-fast] [-trace path]
+           [-driver name] [-gain gain] [-bw bw] [-gpio val] [-EXT_CLOCK]
+           [-NO_SYNC] [-fd dopp] [-log path] [-nmea path] [-rtcm path] [-raw path] ...
+           [-arch nch] [-geom file] [-sens name[,...]] [-fast] [-trace path]
            [-h height] [-opt file] [-debug file] [-v] [file]
 ```
 
@@ -328,8 +345,9 @@ The input can be a local file, a TCP stream, a Pocket SDR FE device, or a SoapyS
   - Sampling frequency of the IF data in MHz. [`12.0`]
 - `-fo freq[,...]`
   - LO frequency for each RF channel in MHz, comma-separated. With
-    `RAW8/16/32`, 2/4/8 frequencies are required. With `-driver`, the first
-    frequency is the SoapySDR RF center frequency and is required.
+    `RAW8/16/32`, 2/4/8 frequencies are required. With `-driver`, these are the
+    SoapySDR RF center frequencies of the RF channels and the first one is
+    required; a channel with an omitted or `0` frequency uses the first one.
 - `-IQ {1|2}[,...]`
   - Per-RF-CH sampling type: `1` = I, `2` = IQ. Used with `RAW8/16/32`. [`2,2,2,2,2,2,2,2`]
 - `-bits {2|3}[,...]`
@@ -347,10 +365,28 @@ The input can be a local file, a TCP stream, a Pocket SDR FE device, or a SoapyS
   - Configure the Pocket SDR FE device with a `pocket_conf`-format file before tracking starts.
 - `-driver name`
   - SoapySDR driver name (`lime`, `hackrf`, `rtlsdr`, `sdrplay`, `bladerf`, ...). Selects a SoapySDR device as the input.
+    Multiple devices are specified as specs separated by `;`, and `nchan=<n>`
+    in a spec selects the number of RX channels of the device (default 1), up
+    to 8 RF channels in total. With multiple devices the external clock and
+    time sources are selected and the streams are started at a common time
+    latched by a 1PPS, so a common 10 MHz and 1PPS have to be distributed to
+    the devices. The RF channels are then handled like the RF channels of a
+    multi-CH frontend, including `-RFCH` assignment and `-arch` array
+    combining.
 - `-gain gain`
   - SoapySDR overall gain in dB.
 - `-bw bw`
   - SoapySDR analog filter bandwidth in MHz.
+- `-gpio val`
+  - Output `val` (0-255) to the GPIO pins of the SoapySDR device (USRP:
+    front-panel GPIO). The pins are set to outputs at the device open.
+- `-EXT_CLOCK`
+  - Select the external clock source of the SoapySDR device.
+- `-NO_SYNC`
+  - With multiple SoapySDR devices, do not synchronize the device times by a
+    1PPS. The devices run on their own clocks and the RF channels of
+    different devices are NOT aligned in samples (for non-coherent uses such
+    as a band per device).
 - `-fd dopp`
   - Maximum Doppler frequency to search signals in Hz. Overrides the `max_dop` key in `-opt file` if both are given. [from `-opt file` or default `5000`]
 - `-log path`
@@ -370,6 +406,10 @@ The input can be a local file, a TCP stream, a Pocket SDR FE device, or a SoapyS
 - `-geom file`
   - Array element positions file (body-frame, `pocket_sdr.py` array
     geometry format) applied at startup. [none]
+- `-sens name[,...]`
+  - Sensors of the RF channels of a SoapySDR device to log every 10 s as
+    `$SENS,<time>,<rfch>,<name>,<value>`, e.g. `temp`, `rssi`, `lo_locked`
+    (RF channel) or `ref_locked` (device) of a USRP. [`temp`]
 - `-fast`
   - Fast acquisition after the first fix: skip satellites below the horizon and search +-500 Hz around
     the Doppler predicted from the ephemeris or almanac, the fix and its clock drift. The time is the
@@ -423,6 +463,7 @@ values are shown in the last column.
 | `srch_budget` | Lock-step search budget (Gflop per s of IF data, `0`: one start per 0.2 s) | `0` | `0` |
 | `srch_budget_cold` | Search budget while fewer than `srch_nsat` satellites are locked (`0`: `srch_budget`) | `0` | `0` |
 | `srch_nsat` | Satellites locked for `srch_budget` instead of `srch_budget_cold` | `5` | `5` |
+| `fast_acq` | Enable fast acquisition (`0`/`1`) | `0` | `0` |
 
 Assisted acquisition uses the larger of `thres_cn0_ext` and the applicable
 tracking-loss threshold plus 1 dB. L6 tracking uses an internal `32.5 dB-Hz`
@@ -430,6 +471,17 @@ loss threshold instead of `thres_cn0_u`. Pilot coherent integration starts only
 after secondary-code synchronization; it falls back to per-code-period Costas
 updates if synchronization is lost or `b_pll * K * T >= 0.4`, where
 `K = max(1, round(t_coh / T))`.
+
+`fast_acq = 1` enables fast acquisition: satellite visibility and Doppler are
+predicted at the receiver time from the navigation data, almanac, and last FIX
+position saved in `.pocket_navdata.csv`, and satellites predicted below the
+horizon are skipped. The receiver time is unknown at start, so the signals are
+acquired by the full search until the TOW and the week number of a received
+signal set the receiver time (receiver sync mode `COARSE`, then `FINE` after
+the first PVT fix, logged as `$LOG ... RECEIVER SYNC`). The prediction does not
+use the host PC clock, so it also works for IF data recorded at a different
+time and for a GNSS simulator. The last FIX position is inherited regardless of
+its time.
 
 All numeric keys other than `fftw_wisdom` are passed to `sdr_rcv_setopt()`.
 
@@ -465,6 +517,8 @@ pocket_web [-web [addr:]port] [-html dir] [-ini file] [-start]
 Run a GNSS receiver as a server controlled from a Web UI in a browser. Static Web UI files are served over HTTP, and commands and monitor data are exchanged over WebSocket (see `doc/design_web_ui.md`). The receiver itself provides the same signal tracking, navigation data decoding, and PVT generation as `pocket_trk`.
 
 The AP does not start the receiver by itself unless `-start` is given. The input source, output streams, signal selection, and system options are all set from the Web UI, and the receiver is started and stopped from there. The settings are restored from `-ini file` at startup and saved when the receiver is stopped and when the AP exits, so a session continues where the previous one left off. The AP prints no runtime status of its own; the receiver is monitored from the Web UI.
+
+The acquisition mode `Fast` of the Web UI (receiver option `-FAST_SRCH`, also selectable in `pocket_sdr.py` and by the `fast_acq` system option key of `pocket_trk`) predicts satellite visibility and Doppler at the receiver time from the navigation data, almanac, and last fix position saved in `.pocket_navdata.csv`. Until the TOW and the week number of a received signal set the receiver time, the signals are acquired by the full search as in the `Full` mode.
 
 ### Options ([]: default)
 

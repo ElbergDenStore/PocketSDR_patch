@@ -1,8 +1,8 @@
 
-# **Pocket SDR - An Open-Source GNSS SDR,<br> ver. 0.20**
+# **Pocket SDR - An Open-Source GNSS SDR,<br> ver. 0.22**
 
 <div style="text-align: right;">
-<strong>2026-08-08</strong>
+<strong>2026-11-03</strong>
 </div>
 
 ---
@@ -505,6 +505,25 @@ Note: FFTW3 is GPL-licensed, so a binary linked against it inherits GPL terms. K
 --------------------------------------------------------------------------------
 <div class="pagebreak"></div>
 
+## **Using AVX-512 instructions (optional)**
+
+On x86-64 CPUs with AVX-512 (AMD Zen 4 or later such as Ryzen 9000 series,
+Intel Ice Lake or later), `libsdr` can be built with `USE_AVX512=1` to use the
+AVX-512 versions of the carrier mixer, correlator, LPF and array covariance
+kernels (`-DAVX512`) instead of the default AVX2 ones. The APs link `libsdr`
+statically, so rebuild them after the library. A binary built with
+`USE_AVX512=1` does not run on a CPU without AVX-512.
+```
+$ cd <install_dir>/lib/build
+$ make clean && make USE_AVX512=1 && make install
+$ cd <install_dir>/app
+$ make clean && make && make install
+```
+The unit tests can be built with the same option: `make -C test/utest USE_AVX512=1`.
+
+--------------------------------------------------------------------------------
+<div class="pagebreak"></div>
+
 ## **GNSS SDR Utilities and APs**
 
 Pocket SDR includes the following utilities for the Pocket SDR FE.
@@ -729,5 +748,38 @@ purposes, is prohibited.
   receiver, even on a headless Raspberry Pi, with the settings kept across
   sessions (see doc/design_web_ui.md). Recovered a Pocket SDR FE left streaming
   by a killed session. pocket_trk keeps its command line.
+- **2026-10-21 (v0.21)**: Added multi-device and multi-channel SoapySDR input:
+  devices sharing a common 10 MHz and 1PPS are opened as one multi-channel
+  frontend (up to 8 RF channels) with the streams started at a common time,
+  including `-RFCH` assignment and `-arch` array combining. Added SoapySDR
+  options `-EXT_CLOCK` and `-gpio`, dropped-sample zero-fill, sensor logging
+  (`-sens`), and multi-channel SoapySDR capture by pocket_dump for replay.
+  Enlarged the Pocket SDR FE raw data buffer to 128 MB with overflow logging
+  and a raised receiver thread priority, fixing the loss of all signals at
+  once at high data rates. Fast acquisition now predicts the satellites at
+  the receiver time instead of the host PC clock, so it also works for a GNSS
+  simulator and replayed IF data. Added AVX512 kernels for the carrier mixer,
+  correlators, LPF and complex multiply (`USE_AVX512=1`). Added a dark theme
+  to pocket_sdr.py. Fixed the satellite week not updated on the TOW rollover,
+  sat_id() for BeiDou B1C / B2a / B2I, the start-time dependent fractional
+  carrier phase bias between channels that broke the integer double-difference
+  ambiguities (GitHub issue #97), and potential buffer overflows in the
+  pocket_web JSON replies (GitHub issue #98).
+- **2026-11-03 (v0.22)**: Redesigned the NB-LDPC decoder internals for the
+  BeiDou B1C / B2a / B2b navigation data: extrinsic EMS with truncated
+  messages and a compensation offset, a layered update schedule, a cached
+  Tanner graph, and a full-alphabet sum-product retry on EMS failure. The
+  error-correction performance is improved by 1.6-1.9 dB and the decoding is
+  7-17x faster, on par with GNSS-SDR (see doc/update_nb_ldpc_decoder.md).
+  Added fast / normal signal search slots and carried over the TOW across a
+  re-acquisition for a fast re-fix after a signal interruption. Shared the
+  DFT of the IF data among the Doppler bins in sdr_search_code() to speed up
+  the signal search (GitHub PR #99). Added NEON carrier mixing of 64 phases
+  by table lookup to the tracking correlator (GitHub PR #101). Fixed the
+  16 KB block misorder of the FE 4CH / 8CH IF data after a USB reset (GitHub
+  PR #100), the azimuth / elevation angles not updated for unhealthy
+  satellites while the PVT solution is available, and the satellite health
+  evaluation on the Satellites pages of the GUI and the Web UI by masking
+  the QZSS L1C/A and L1C/B health flags.
 
 --------------------------------------------------------------------------------

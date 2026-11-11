@@ -145,27 +145,48 @@ static void test_sdr_tag_api(void)
     int bits[SDR_MAX_RFCH] = {4, 2};
     int bits2[SDR_MAX_RFCH] = {0};
     char prog[32] = "";
-    int fmt = 0;
+    int fmt = 0, nch = 0;
     double fs = 0.0;
     
     TEST_ASSERT_EQ_INT(1, sdr_tag_write(TMP_TAG, "utest", time, SDR_FMT_RAW8,
-        24e6, fo, IQ, bits));
-    TEST_ASSERT_EQ_INT(1, sdr_tag_read(TMP_TAG, prog, &time2, &fmt, &fs, fo2,
-        IQ2, bits2));
+        0, 24e6, fo, IQ, bits));
+    TEST_ASSERT_EQ_INT(1, sdr_tag_read(TMP_TAG, prog, &time2, &fmt, &nch, &fs,
+        fo2, IQ2, bits2));
     TEST_ASSERT_TRUE(!strcmp("utest", prog));
     TEST_ASSERT_EQ_INT(SDR_FMT_RAW8, fmt);
+    TEST_ASSERT_EQ_INT(2, nch); // as defined by the format
     TEST_ASSERT_NEAR(24e6, fs, 1.0);
     TEST_ASSERT_NEAR(1575.42e6, fo2[0], 1.0);
     TEST_ASSERT_EQ_INT(2, IQ2[0]);
     TEST_ASSERT_EQ_INT(4, bits2[0]);
     TEST_ASSERT_EQ_INT(0, IQ2[2]);
     
-    TEST_ASSERT_EQ_INT(0, sdr_tag_write(TMP_TAG, "utest", time, 0, fs, fo, IQ,
-        bits));
+    // CH planar IF data of a single CH format
+    TEST_ASSERT_EQ_INT(1, sdr_tag_write(TMP_TAG, "utest", time, SDR_FMT_CS16,
+        4, 24e6, fo, IQ, bits));
+    TEST_ASSERT_EQ_INT(1, sdr_tag_read(TMP_TAG, NULL, NULL, &fmt, &nch, &fs,
+        fo2, IQ2, bits2));
+    TEST_ASSERT_EQ_INT(SDR_FMT_CS16, fmt);
+    TEST_ASSERT_EQ_INT(4, nch);
+    
+    // nch is optional for backward compatibility with old tag files
+    write_file(TMP_BAD_TAG ".tag", "FMT = CS16\n", 11);
+    nch = 0;
+    TEST_ASSERT_EQ_INT(1, sdr_tag_read(TMP_BAD_TAG, NULL, NULL, &fmt, &nch,
+        &fs, fo2, IQ2, bits2));
+    TEST_ASSERT_EQ_INT(1, nch);
+    
+    // a planar IF data of a different processing cycle is unusable
+    write_file(TMP_BAD_TAG ".tag", "FMT = CS16\nNCH = 4\nT_CYC = 0.002\n", 33);
+    TEST_ASSERT_EQ_INT(-1, sdr_tag_read(TMP_BAD_TAG, NULL, NULL, &fmt, &nch,
+        &fs, fo2, IQ2, bits2));
+    
+    TEST_ASSERT_EQ_INT(0, sdr_tag_write(TMP_TAG, "utest", time, 0, 0, fs, fo,
+        IQ, bits));
     
     write_file(TMP_BAD_TAG ".tag", "FMT = -\n", 8);
-    TEST_ASSERT_EQ_INT(0, sdr_tag_read(TMP_BAD_TAG, NULL, NULL, &fmt, &fs, fo2,
-        IQ2, bits2));
+    TEST_ASSERT_EQ_INT(0, sdr_tag_read(TMP_BAD_TAG, NULL, NULL, &fmt, &nch,
+        &fs, fo2, IQ2, bits2));
 }
 
 // sdr_mix_carr() --------------------------------------------------------------
@@ -190,6 +211,44 @@ static void test_sdr_mix_carr_api(void)
     TEST_ASSERT_EQ_INT(-11, IQ[0].Q);
     TEST_ASSERT_EQ_INT(11, IQ[1].I);
     TEST_ASSERT_EQ_INT(-22, IQ[1].Q);
+    sdr_buff_free(buff);
+}
+
+// reference carrier mixing by the LUT formula ---------------------------------
+static void ref_mix_carr(const sdr_buff_t *buff, int ix, int N, double fs,
+    double fc, double phi, sdr_cpx16_t *IQ)
+{
+    double scale = (double)(1 << 24) * 256;
+    uint32_t p = (uint32_t)((phi - floor(phi)) * scale);
+    uint32_t s = (uint32_t)(int)(fc / fs * scale);
+
+    for (int i = 0; i < N; i++, p += s) {
+        int k = p >> 24, I = SDR_CPX8_I(buff->data[ix+i]);
+        int Q = SDR_CPX8_Q(buff->data[ix+i]);
+        int cI = (int)floor(cos(-2.0 * PI * k / 256) / SDR_CSCALE + 0.5);
+        int cQ = (int)floor(sin(-2.0 * PI * k / 256) / SDR_CSCALE + 0.5);
+        IQ[i].I = (int8_t)(I * cI - Q * cQ);
+        IQ[i].Q = (int8_t)(I * cQ + Q * cI);
+    }
+}
+
+// sdr_mix_carr() vs reference for all lengths including SIMD tails ------------
+static void test_sdr_mix_carr_equiv(void)
+{
+    const int NB = 1024;
+    sdr_buff_t *buff = sdr_buff_new(NB, 2);
+    sdr_cpx16_t IQ[256], ref[256];
+
+    for (int i = 0; i < NB; i++) {
+        buff->data[i] = (sdr_cpx8_t)((i * 37 + 11) & 0xFF);
+    }
+    for (int N = 1; N <= 160; N++) {
+        int ix = (N * 7) % 512;
+        double fc = -4200.0 + N * 123.4, phi = 0.0137 * N;
+        ref_mix_carr(buff, ix, N, 24e6, fc, phi, ref);
+        sdr_mix_carr(buff, ix, N, 24e6, fc, phi, IQ);
+        TEST_ASSERT_TRUE(!memcmp(IQ, ref, sizeof(sdr_cpx16_t) * N));
+    }
     sdr_buff_free(buff);
 }
 
@@ -720,6 +779,25 @@ static void test_sdr_lpf_api(void)
     sdr_lpf_free(lpf);
 }
 
+// sdr_lpf_apply() in one call vs. short chunks (SIMD path vs scalar path) -----
+static void test_sdr_lpf_apply_equiv(void)
+{
+    const int N = 1100;
+    sdr_cpx8_t data1[1100], data2[1100];
+    sdr_lpf_t *lpf1 = sdr_lpf_new(3e6, 24e6), *lpf2 = sdr_lpf_new(3e6, 24e6);
+
+    for (int i = 0; i < N; i++) {
+        data1[i] = data2[i] = (sdr_cpx8_t)((i * 53 + 7) & 0xFF);
+    }
+    sdr_lpf_apply(lpf1, data1, N);
+    for (int i = 0; i < N; i += 3) {
+        sdr_lpf_apply(lpf2, data2 + i, N - i < 3 ? N - i : 3);
+    }
+    TEST_ASSERT_TRUE(!memcmp(data1, data2, N));
+    sdr_lpf_free(lpf1);
+    sdr_lpf_free(lpf2);
+}
+
 // main ------------------------------------------------------------------------
 int main(void)
 {
@@ -729,6 +807,7 @@ int main(void)
     TEST_RUN(test_sdr_buff_read_api);
     TEST_RUN(test_sdr_tag_api);
     TEST_RUN(test_sdr_mix_carr_api);
+    TEST_RUN(test_sdr_mix_carr_equiv);
     TEST_RUN(test_sdr_corr_api);
     TEST_RUN(test_sdr_corr_std_equiv);
     TEST_RUN(test_sdr_corr_std_cpx_code_equiv);
@@ -742,6 +821,7 @@ int main(void)
     TEST_RUN(test_sdr_bit_api);
     TEST_RUN(test_sdr_fftw_wisdom_api);
     TEST_RUN(test_sdr_lpf_api);
+    TEST_RUN(test_sdr_lpf_apply_equiv);
     cleanup_files();
     return 0;
 }

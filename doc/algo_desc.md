@@ -1,7 +1,7 @@
 ﻿# Pocket SDR GNSS SDR Algorithm Description
 
 <div style="text-align: right;">
-<strong>ver.0.19  2026-07-20</strong>
+<strong>ver.0.21  2026-10-21</strong>
 </div>
 
 ---
@@ -1027,7 +1027,9 @@ Doppler range, C/N0, carrier lock indicator (`pli`) and its valid flag,
 week/TOW, lock count, loss count and the loss-decision counter (`lost_cnt`),
 Costas/non-Costas mode, pilot classification, and navigation state.
 
-`start_track()` resets the dynamic tracking and navigation states. It does not
+`start_track()` resets the dynamic tracking and navigation states and
+initializes the carrier NCO phase on the common receiver time origin (§4.8).
+It does not
 regenerate codes or FFTs because those are permanent channel resources. This
 makes reacquisition cheap: the channel can move from idle to search to lock
 without rebuilding signal-specific resources.
@@ -1062,6 +1064,20 @@ full carrier `f_c = f_i + f_d`, reduced to `[0, 1)` cycle each epoch by
 subtracting its floor (this keeps precision bounded; the mixer only needs the
 fractional phase). It is kept separate from `adr`, the Doppler-only accumulator
 used for the carrier-phase observable.
+
+At tracking start, `phi` is initialized to `frac(f_i * t)` on the common
+receiver time origin (`init_phi()`), not to zero. In lock the PLL drives `phi`
+to the incoming phase, so `adr = phi - f_i*(t - t0) - phi_0` would, with
+`phi_0 = 0`, carry the channel-dependent fractional bias `frac(f_i * t0)` set
+by the tracking start time `t0`. Start times lie on the 1 ms processing grid,
+so the bias cancels between satellites only when `f_i` is a multiple of 1 kHz;
+otherwise it breaks the integer nature of double-difference carrier-phase
+ambiguities and changes at every reacquisition (GitHub issue #97). Referencing
+all channels to the common time origin removes the `t0` dependence. To keep
+the initialization accurate over long runs, `f_i * t` is not formed as one
+double product: the millisecond count is split into integer seconds and
+residual milliseconds and the integer part of `f_i` is separated out, which
+bounds the error below 1e-7 cycle even after months of continuous operation.
 
 Accumulating `phi` continuously (rather than recomputing `f_i*tau + adr` per
 epoch) keeps the carrier coherent across code-period boundaries. This matters
@@ -1836,6 +1852,12 @@ Additional half-cycle and quarter-cycle corrections are then applied:
 - several signals require fixed quarter-cycle phase alignment corrections;
 - some BeiDou GEO/IGSO/MEO legacy paths require additional half-cycle handling.
 
+The fractional part of `L` is aligned across channels: the carrier NCO phase
+is initialized on the common receiver time origin at tracking start (§4.8), so
+`L` carries no start-time dependent fractional bias and between-satellite
+differences preserve the integer nature of double-difference ambiguities even
+when the modeled IF frequency is not an integer multiple of 1 kHz.
+
 The result is a carrier-phase observable in cycles. It is not ambiguity-fixed;
 it is a continuous tracking observable with possible loss-of-lock indicators.
 The PVT solver in this receiver path uses pseudorange for single-point
@@ -2010,8 +2032,8 @@ runs a small fixed-size chip-domain FFT each symbol to search the CSK
 code-phase shift; its E/P/L correlations use the time-domain correlator like
 any other signal.
 
-The low-level carrier mixer and correlator include AVX2 and NEON paths where
-available. Complex samples and code replicas are stored in compact integer
+The low-level carrier mixer and correlator include AVX2, AVX-512 and NEON paths
+where available. Complex samples and code replicas are stored in compact integer
 formats so the hot loops can use vector integer operations.
 
 ### 7.5 Search Load Control and Doppler Assistance
@@ -2082,7 +2104,8 @@ and FFT correlation per bin.
 
 ### 7.10 SIMD Hot Paths
 
-The low-level functions include AVX2 and NEON blocks for two key operations:
+The low-level functions include AVX2, AVX-512 (`-DAVX512`, `USE_AVX512=1`) and
+NEON blocks for two key operations:
 
 - carrier mixing from compact IF samples to `sdr_cpx16_t`;
 - dot products between carrier-wiped samples and code replicas.
@@ -2093,8 +2116,16 @@ operations rather than general floating-point multiplication. The scalar loops
 remain as portable fallbacks.
 
 The implementation keeps the public algorithm independent of the SIMD path.
-Acquisition, tracking, and PVT behavior should not change when AVX2 or NEON is
-not available; only throughput changes.
+Acquisition, tracking, and PVT behavior should not change when AVX2, AVX-512 or
+NEON is not available; only throughput changes.
+
+The AVX-512 path differs from the AVX2 one in two points. The carrier mixer does
+not use the 64K-entry data x carrier LUT; it computes `(I + jQ)(cos - j sin)` in
+int16 lanes, 32 samples per iteration, with the 8-bit phase mapped to the
+carrier by a 256-entry LUT held in registers (`vpermi2w`). The correlator inner
+product uses the VNNI instruction `vpdpbusd` (u8 x s8 to int32) on 32 samples
+per instruction, and the tails are handled by masked loads so no scalar loop
+runs. Both are bit-identical to the scalar path.
 
 The two figures below show the AVX2 vectorization of the two hottest kernels,
 carrier mixing (`mix_carr()`) and the correlator inner product (`dot_IQ_code()`).
