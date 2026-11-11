@@ -18,6 +18,8 @@
 //  2026-10-25  1.5  accept observation data of the channels with the TOW
 //                   carried over a re-acquisition
 //                   inherit the last fix position regardless of the CPU time
+//  2026-11-11  1.6  add the PVT's C/N0 mask and C/N0 weighting (options
+//                   cn0_mask, cn0_weight)
 //
 #include "pocket_sdr.h"
 
@@ -38,6 +40,10 @@
 double sdr_epoch     = SDR_EPOCH;
 double sdr_lag_epoch = LAG_EPOCH;
 double sdr_el_mask   = EL_MASK;
+double sdr_cn0_mask  = 0.0;     // C/N0 mask for PVT (dB-Hz) (0: off)
+double sdr_cn0_weight = 0.0;    // C/N0 at which a pseudorange's variance is
+                                // unscaled, x10^((cn0_weight-cn0)/10) below
+                                // it (dB-Hz) (0: off)
 static const int systems[] = {
     SYS_GPS, SYS_GLO, SYS_GAL, SYS_QZS, SYS_CMP, SYS_IRN, SYS_SBS, 0
 };
@@ -1129,6 +1135,11 @@ static void update_sol(sdr_pvt_t *pvt)
     opt.ionoopt = IONOOPT_BRDC;
     opt.tropopt = TROPOPT_SAAS;
     opt.elmin = sdr_el_mask * D2R;
+    if (sdr_cn0_mask > 0.0) {
+        opt.snrmask.ena[0] = 1;
+        for (int i = 0; i < 9; i++) opt.snrmask.mask[0][i] = sdr_cn0_mask;
+    }
+    opt.snrweight = sdr_cn0_weight;
 #if 1 // RAIM-FDE on
     opt.posopt[4] = 1;
 #endif

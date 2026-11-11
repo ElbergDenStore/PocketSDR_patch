@@ -43,6 +43,7 @@
 //  2026-11-11  1.18 merge v0.22 into CRPA-Research: start_srch_ch() fills the
 //                   fast slot with known-Doppler searches only; lock-step
 //                   starts its budget's searches in the normal slot
+//  2026-11-11  1.19 add options cn0_mask and cn0_weight (PVT)
 //
 #include "pocket_sdr.h"
 #ifndef WIN32
@@ -2553,6 +2554,7 @@ static void set_srch_ns(const char *sig, double ns, int gpu)
 void sdr_rcv_setopt(const char *opt, double value)
 {
     extern double sdr_epoch, sdr_lag_epoch, sdr_el_mask, sdr_sp_corr, sdr_t_acq;
+    extern double sdr_cn0_mask, sdr_cn0_weight;
     extern double sdr_t_acq_ext, sdr_t_coh, sdr_thres_cn0_ext;
     extern double sdr_t_dll, sdr_b_dll, sdr_b_pll, sdr_b_fll_w, sdr_b_fll_n;
     extern double sdr_max_dop, sdr_dop_ctr, sdr_thres_cn0_l, sdr_thres_cn0_u, sdr_thres_pli;
@@ -2560,6 +2562,8 @@ void sdr_rcv_setopt(const char *opt, double value)
     if      (!strcmp(opt, "epoch"      )) sdr_epoch       = value;
     else if (!strcmp(opt, "lag_epoch"  )) sdr_lag_epoch   = value;
     else if (!strcmp(opt, "el_mask"    )) sdr_el_mask     = value;
+    else if (!strcmp(opt, "cn0_mask"   )) sdr_cn0_mask    = value;
+    else if (!strcmp(opt, "cn0_weight" )) sdr_cn0_weight  = value;
     else if (!strcmp(opt, "sp_corr"    )) sdr_sp_corr     = value;
     else if (!strcmp(opt, "t_acq"      )) sdr_t_acq       = value;
     else if (!strcmp(opt, "t_acq_ext"  ) && value > 0.0) sdr_t_acq_ext = value;

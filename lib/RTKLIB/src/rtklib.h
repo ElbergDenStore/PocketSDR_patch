@@ -1040,6 +1040,8 @@ typedef struct {        /* processing options type */
     double odisp[2][6*11]; /* ocean tide loading parameters {rov,base} */
     int  freqopt;       /* disable L2-AR */
     char pppopt[256];   /* ppp option */
+    double snrweight;   /* SNR (dBHz) at which pntpos code variance is unscaled;
+                           x10^((snrweight-snr)/10) below it (0:off) */
 } prcopt_t;
 
 typedef struct {        /* solution options type */

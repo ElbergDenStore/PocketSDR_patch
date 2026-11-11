@@ -26,6 +26,8 @@
 *
 *           branch for Pocket SDR
 *           2026/06/01 0.1  add receiver clock rate in solution.
+*           2026/11/11 0.2  scale the code error variance by the SNR
+*                           (prcopt_t snrweight)
 *-----------------------------------------------------------------------------*/
 #include "rtklib.h"
 
@@ -74,6 +76,14 @@ static double gettgd(int sat, const nav_t *nav, int type)
         }
         return (i>=nav->n)?0.0:nav->eph[i].tgd[type]*CLIGHT;
     }
+}
+/* SNR scale of the code error variance (prcopt_t snrweight) ----------------*/
+static double snrfact(const obsd_t *obs, const prcopt_t *opt)
+{
+    double snr=obs->SNR[0]*SNR_UNIT;
+    
+    if (opt->snrweight<=0.0||snr<=0.0||snr>=opt->snrweight) return 1.0;
+    return pow(10.0,(opt->snrweight-snr)/10.0);
 }
 /* test SNR mask -------------------------------------------------------------*/
 static int snrmask(const obsd_t *obs, const double *azel, const prcopt_t *opt)
@@ -327,7 +337,8 @@ static int rescode(int iter, const obsd_t *obs, int n, const double *rs,
         vsat[i]=1; resp[i]=v[nv]; (*ns)++;
         
         /* variance of pseudorange error */
-        var[nv++]=varerr(opt,azel[1+i*2],sys)+vare[i]+vmeas+vion+vtrp;
+        var[nv++]=(varerr(opt,azel[1+i*2],sys)+vmeas)*snrfact(obs+i,opt)+
+                  vare[i]+vion+vtrp;
         
         trace(4,"sat=%2d azel=%5.1f %4.1f res=%7.3f sig=%5.3f\n",obs[i].sat,
               azel[i*2]*R2D,azel[1+i*2]*R2D,resp[i],sqrt(var[nv-1]));

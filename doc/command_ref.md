@@ -443,6 +443,8 @@ values are shown in the last column.
 | `epoch` | PVT epoch interval (s) | `1.0` | `1.0` |
 | `lag_epoch` | Maximum PVT epoch lag (s) | `0.5` | `0.5` |
 | `el_mask` | PVT elevation mask (deg) | `15` | `15` |
+| `cn0_mask` | PVT C/N0 mask (dB-Hz, `0`: off) | `0` | `32` |
+| `cn0_weight` | C/N0 at which a pseudorange's PVT variance is unscaled; below it the variance is multiplied by `10^((cn0_weight - C/N0)/10)` (dB-Hz, `0`: off) | `0` | `50` |
 | `sp_corr` | Early/late correlator spacing (chip) | `0.25` | `0.2` |
 | `t_acq` | Normal-acquisition integration time (s) | `0.02` | `0.02` |
 | `t_acq_ext` | Doppler-assisted acquisition integration time (s) | `0.10` | `0.10` |
