@@ -57,6 +57,8 @@
 //  2026-06-13  1.9  update symbol-sync algorithm in symb_sync()
 //  2026-10-25  1.10 confirm or reject the TOW carried over a re-acquisition
 //                   in update_tow()
+//  2026-11-11  1.11 count the L1CA LNAV week's repeats (nav->week_n), so a
+//                   lone L1CA CH seeds the PVT epoch (sdr_pvt.c init_epoch())
 //
 #include "pocket_sdr.h"
 
@@ -634,8 +636,11 @@ static void decode_LNAV(sdr_ch_t *ch, const uint8_t *syms, int rev)
         ch->nav->fsync = ch->lock;
         ch->nav->rev = rev;
         int sf = getbitu(data, 43, 3);
-        if (sf == 1) {
-            ch->week = getbitu(data, 48, 10) + GPST_OFF_W;
+        if (sf == 1) { // the week's repeats as update_week_tow() counts them
+            int week = getbitu(data, 48, 10) + GPST_OFF_W;
+            ch->nav->week_n = week == ch->nav->week_p ? ch->nav->week_n + 1 : 1;
+            ch->nav->week_p = week;
+            ch->week = week;
         }
         update_tow(ch, getbitu(data, 24, 17) * 6.0 + TOFF_L1CA);
         ch->nav->type = sf; // SF ID
