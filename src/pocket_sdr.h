@@ -510,6 +510,9 @@ int sdr_tag_read(const char *file, char *prog, gtime_t *time, int *fmt,
 void sdr_search_code(const sdr_cpx_t *code_fft, double T,
     const sdr_buff_t *buff, int ix, int N, double fs, double fi,
     const float *fds, int len_fds, float *P);
+void sdr_search_code_drift(const sdr_cpx_t *code_fft, double T,
+    const sdr_buff_t *buff, int ix, int N, double fs, double fi,
+    const float *fds, int len_fds, double dc, float *P);
 float sdr_corr_max(const float *P, int N, int Nmax, int M, double T, int *ix);
 double sdr_fine_dop(const float *P, int N, const float *fds, int len_fds,
     const int *ix);
@@ -584,6 +587,7 @@ void sdr_ch_free(sdr_ch_t *ch);
 void sdr_ch_update(sdr_ch_t *ch, double time, const sdr_buff_t *buff, int ix);
 void sdr_ch_set_corr(sdr_ch_t *ch, int nposx, double width);
 int sdr_ch_srch_gpu(const sdr_ch_t *ch);
+void sdr_ch_set_thres_l(const char *sig, double thres);
 extern int (*sdr_srch_gpu_take)(const sdr_ch_t *ch, int M, int len_fds, int k);
 extern int (*sdr_srch_gpu_run)(const sdr_ch_t *ch, const sdr_buff_t *buff,
     int ix, int M, const float *fds, int len_fds, int k, sdr_srch_res_t *res);

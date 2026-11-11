@@ -39,6 +39,8 @@
 //                   both sidebands in one pass once the polarity is calibrated
 //  2026-07-19  1.26 improve low-C/N0 acquisition and pilot tracking
 //  2026-10-30  1.27 searches on GPU hooks (option srch_gpu)
+//  2026-11-11  1.28 searches follow the code's drift (sdr_search_code_drift),
+//                   option thres_cn0_l_<sig>
 //
 #include <ctype.h>
 #include <math.h>
@@ -94,6 +96,11 @@ double sdr_b_fll_n = B_FLL_N;
 double sdr_max_dop = MAX_DOP;
 double sdr_dop_ctr = 0.0;   // center of the Doppler search bins (Hz)
 double sdr_thres_cn0_l = THRES_CN0_L;
+static struct {            // a signal's own (option thres_cn0_l_<sig>)
+    char sig[16];
+    double thres;
+} thres_l[SDR_MAX_NSIG];
+static int n_thres_l = 0;
 double sdr_thres_cn0_u = THRES_CN0_U;
 double sdr_thres_cn0_ext = THRES_CN0_EXT;
 double sdr_thres_pli = THRES_PLI; // carrier lock detector threshold
@@ -542,6 +549,41 @@ static void start_track(sdr_ch_t *ch, double time, double fd, double coff,
     sdr_nav_init(ch->nav);
 }
 
+//------------------------------------------------------------------------------
+//  A signal's own C/N0 threshold for a cold search (option thres_cn0_l_<sig>,
+//  else thres_cn0_l): a search's noise peak falls with the cells it searches
+//  and the periods it sums, which differ per signal.
+//
+//  args:
+//      sig      (I)  Signal ID
+//      thres    (I)  Threshold (dB-Hz)
+//
+//  return:
+//      none
+//
+void sdr_ch_set_thres_l(const char *sig, double thres)
+{
+    int i = 0;
+    
+    for ( ; i < n_thres_l && strcmp(thres_l[i].sig, sig); i++) ;
+    if (i == SDR_MAX_NSIG) {
+        fprintf(stderr, "sdr_rcv_setopt error: too many thres_cn0_l_<sig>\n");
+        return;
+    }
+    if (i == n_thres_l) n_thres_l++;
+    snprintf(thres_l[i].sig, sizeof(thres_l[i].sig), "%s", sig);
+    thres_l[i].thres = thres;
+}
+
+// the cold search's threshold of signal sig -----------------------------------
+static double thres_cn0_l(const char *sig)
+{
+    for (int i = 0; i < n_thres_l; i++) {
+        if (!strcmp(thres_l[i].sig, sig)) return thres_l[i].thres;
+    }
+    return sdr_thres_cn0_l;
+}
+
 // Doppler bins and code periods of the search CH starts next ------------------
 static void srch_shape(const sdr_ch_t *ch, int *n, double *df, int *M)
 {
@@ -631,9 +673,14 @@ static void search_sig(sdr_ch_t *ch, double time, const sdr_buff_t *buff,
             sdr_free(ch->acq->P_sum);
             ch->acq->P_sum = (float *)sdr_malloc(sizeof(float) * 2 * ch->N * n);
         }
-        // parallel code search and non-coherent integration
-        sdr_search_code(ch->acq->code_fft, ch->T, buff, ix, 2 * ch->N, ch->fs,
-            ch->fi, fds, n, ch->acq->P_sum);
+        // parallel code search and non-coherent integration, each period's
+        // powers at the lags of the last one's (the code's drift followed)
+        int ns, M;
+        double df;
+        srch_shape(ch, &ns, &df, &M);
+        double dc = ch->N * (M - 1 - ch->acq->n_sum) / ch->fc;
+        sdr_search_code_drift(ch->acq->code_fft, ch->T, buff, ix, 2 * ch->N,
+            ch->fs, ch->fi, fds, n, dc, ch->acq->P_sum);
     }
     ch->acq->n_sum++;
     
@@ -655,7 +702,7 @@ static void search_sig(sdr_ch_t *ch, double time, const sdr_buff_t *buff,
                 idx);
         }
         
-        double thres = sdr_thres_cn0_l;
+        double thres = thres_cn0_l(ch->sig);
         if (assisted) {
             double lost = !strncmp(ch->sig, "L6", 2) ? THRES_CN0_L6 :
                 sdr_thres_cn0_u;

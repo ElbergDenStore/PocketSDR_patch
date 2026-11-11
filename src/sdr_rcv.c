@@ -2390,6 +2390,7 @@ void sdr_rcv_setopt(const char *opt, double value)
     else if (!strcmp(opt, "max_dop"    )) sdr_max_dop     = value;
     else if (!strcmp(opt, "dop_ctr"    )) sdr_dop_ctr     = value;
     else if (!strcmp(opt, "thres_cn0_l")) sdr_thres_cn0_l = value;
+    else if (!strncmp(opt, "thres_cn0_l_", 12)) sdr_ch_set_thres_l(opt + 12, value);
     else if (!strcmp(opt, "thres_cn0_u")) sdr_thres_cn0_u = value;
     else if (!strcmp(opt, "thres_cn0_ext") && value > 0.0)
         sdr_thres_cn0_ext = value;

@@ -64,6 +64,7 @@
 //                   add API sdr_log_add_str(), sdr_log_rm_str()
 //  2026-08-08  1.31 fix memory leak of stream in sdr_str_close()
 //  2026-10-14  1.32 one IF data FFT per search in sdr_search_code()
+//  2026-11-11  1.33 add API sdr_search_code_drift()
 //
 #include <math.h>
 #include <stdarg.h>
@@ -704,10 +705,14 @@ int sdr_tag_read(const char *file, char *prog, gtime_t *time, int *fmt,
     return 1;
 }
 
-// code search with Doppler bins k FFT bins apart (below) --------------------
+// code search with Doppler bins k FFT bins apart, FFT correlator with the
+// code's drift (below) ---------------------------------------------------------
 static void search_code_shift(const sdr_cpx_t *code_fft, const sdr_buff_t *buff,
-    int ix, int N, double fs, double fc, int k, int len_fds, sdr_cpx_t *C,
-    float *P);
+    int ix, int N, double fs, double fi, const float *fds, int k, int len_fds,
+    double dc, sdr_cpx_t *C, float *P);
+static void corr_fft_drift(const sdr_buff_t *buff, int ix, int N, double fs,
+    double fc, double phi, const sdr_cpx_t *code_fft, double d,
+    sdr_cpx_t *corr);
 
 //------------------------------------------------------------------------------
 //  Parallel code search in digitized IF data.
@@ -732,13 +737,33 @@ void sdr_search_code(const sdr_cpx_t *code_fft, double T,
     const sdr_buff_t *buff, int ix, int N, double fs, double fi,
     const float *fds, int len_fds, float *P)
 {
+    sdr_search_code_drift(code_fft, T, buff, ix, N, fs, fi, fds, len_fds, 0.0,
+        P);
+}
+
+//------------------------------------------------------------------------------
+//  sdr_search_code() with the code's drift: each bin's correlations taken at
+//  lags shifted by dc * fd (samples, fd the bin's Doppler), so that the powers
+//  of a non-coherent sum add at the lag of its last period, where the code is
+//  when the track starts (the code's delay falls by fd / fc per second: N/2 /
+//  fc * (M - 1 - m) for period m of M at N/2 samples a period). Exact in a
+//  fractional shift: the correlation's spectrum times exp(2 pi i f dc fd / N).
+//
+//  args:
+//      dc       (I)  Lag shift per Hz of Doppler (samples / Hz)
+//      (others as sdr_search_code())
+//
+void sdr_search_code_drift(const sdr_cpx_t *code_fft, double T,
+    const sdr_buff_t *buff, int ix, int N, double fs, double fi,
+    const float *fds, int len_fds, double dc, float *P)
+{
     sdr_cpx_t *C = sdr_cpx_malloc(N);
     double step = len_fds > 1 ? (fds[1] - fds[0]) * N / fs : 0.0;
     int k = (int)floor(step + 0.5);
     
     // Doppler step of k FFT bins: one IF data FFT, each bin a circular shift
     if (k > 0 && fabs(step - k) < 1e-3) {
-        search_code_shift(code_fft, buff, ix, N, fs, fi + fds[0], k, len_fds,
+        search_code_shift(code_fft, buff, ix, N, fs, fi, fds, k, len_fds, dc,
             C, P);
         sdr_cpx_free(C);
         return;
@@ -746,7 +771,8 @@ void sdr_search_code(const sdr_cpx_t *code_fft, double T,
     for (int i = 0; i < len_fds; i++) {
         
         // mix carrier and FFT correlator
-        sdr_corr_fft(buff, ix, N, fs, fi + fds[i], 0.0, code_fft, C);
+        corr_fft_drift(buff, ix, N, fs, fi + fds[i], 0.0, code_fft,
+            dc * fds[i], C);
         
         // add correlation power
         for (int j = 0; j < N; j++) {
@@ -1405,23 +1431,45 @@ static sdr_cpx_t *corr_fft_buff(int N)
     return cpx;
 }
 
+// correlation spectrum C (N) times exp(2 pi i f d / N), f its FFT bins' signed
+// frequencies: its IFFT's lag j becomes lag j + d (samples) -------------------
+static void drift_ramp(sdr_cpx_t *C, int N, double d)
+{
+    if (d == 0.0) return;
+    double w = 2.0 * PI * d / N, wr = cos(w), wi = sin(w);
+    
+    for (int h = 0; h < 2; h++) { // f = 0 ... N/2-1, then -N/2 ... -1
+        int n0 = h ? N / 2 : 0, n1 = h ? N : N / 2;
+        double zr = cos(w * (n0 - h * N)), zi = sin(w * (n0 - h * N));
+        for (int n = n0; n < n1; n++) {
+            double re = C[n][0], im = C[n][1], t = zr * wr - zi * wi;
+            C[n][0] = (float)(re * zr - im * zi);
+            C[n][1] = (float)(re * zi + im * zr);
+            zi = zr * wi + zi * wr;
+            zr = t;
+        }
+    }
+}
+
 // code search with Doppler bins k FFT bins apart: spectrum of the IF data mixed
-// by fc, shifted by i * k bins for bin i (= mixing by fc + i * k * fs / N) ----
+// by fi + fds[0], shifted by i * k bins for bin i (= mixing by fi + fds[i]), the
+// lags shifted by dc * fds[i] ---------------------------------------------------
 static void search_code_shift(const sdr_cpx_t *code_fft, const sdr_buff_t *buff,
-    int ix, int N, double fs, double fc, int k, int len_fds, sdr_cpx_t *C,
-    float *P)
+    int ix, int N, double fs, double fi, const float *fds, int k, int len_fds,
+    double dc, sdr_cpx_t *C, float *P)
 {
     sdr_cpx_t *cpx = corr_fft_buff(N), *X = cpx + N;
     
-    mix_carr_cpx(buff, ix, N, 0.0, fc / fs, cpx);
+    mix_carr_cpx(buff, ix, N, 0.0, (fi + fds[0]) / fs, cpx);
     if (!sdr_cpx_fft(cpx, N, SDR_FFT_FORWARD, X)) return;
     
     for (int i = 0; i < len_fds; i++) {
         int s = (int)((int64_t)i * k % N);
         
-        // ifft(shift(X, s) * code_fft) / N^2
+        // ifft(shift(X, s) * code_fft * ramp) / N^2
         sdr_cpx_mul(X + s, code_fft, N - s, 1.0f / N / N, cpx);
         sdr_cpx_mul(X, code_fft + N - s, s, 1.0f / N / N, cpx + N - s);
+        drift_ramp(cpx, N, dc * fds[i]);
         if (!sdr_cpx_fft(cpx, N, SDR_FFT_BACKWARD, C)) return;
         
         // add correlation power
@@ -1455,13 +1503,22 @@ static void search_code_shift(const sdr_cpx_t *code_fft, const sdr_buff_t *buff,
 void sdr_corr_fft(const sdr_buff_t *buff, int ix, int N, double fs, double fc,
     double phi, const sdr_cpx_t *code_fft, sdr_cpx_t *corr)
 {
+    corr_fft_drift(buff, ix, N, fs, fc, phi, code_fft, 0.0, corr);
+}
+
+// FFT correlator, lags shifted by d (samples) ----------------------------------
+static void corr_fft_drift(const sdr_buff_t *buff, int ix, int N, double fs,
+    double fc, double phi, const sdr_cpx_t *code_fft, double d,
+    sdr_cpx_t *corr)
+{
     sdr_cpx_t *cpx = corr_fft_buff(N);
     
     mix_carr_cpx(buff, ix, N, phi, fc / fs, cpx);
     
-    // ifft(fft(data) * code_fft) / N^2
+    // ifft(fft(data) * code_fft * ramp) / N^2
     if (sdr_cpx_fft(cpx, N, SDR_FFT_FORWARD, cpx + N)) {
         sdr_cpx_mul(cpx + N, code_fft, N, 1.0f / N / N, cpx);
+        drift_ramp(cpx, N, d);
         (void)sdr_cpx_fft(cpx, N, SDR_FFT_BACKWARD, corr);
     }
 }
