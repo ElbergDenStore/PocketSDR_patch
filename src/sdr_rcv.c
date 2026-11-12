@@ -1675,19 +1675,22 @@ static void wake_ch_ls(sdr_rcv_t *rcv)
     sdr_mutex_unlock(&rcv->mtx);
 }
 
-// lock-step: wait for CHs within LOCK_LAG of ix (sync: all data up to ix),
-// except parked ones ----------------------------------------------------------
+// lock-step: wait for CHs within LOCK_LAG of ix (sync 1: all data up to ix
+// except CHs after a recent search start; sync 2, at the end of the data: all
+// data up to ix, so a long search ends by the data, not by wall time), except
+// parked ones ----------------------------------------------------------------
 static void wait_ch_lag(sdr_rcv_t *rcv, int64_t ix, int sync)
 {
     int waited = 0;
-    
+
     sdr_mutex_lock(&rcv->mtx);
     for (int i = 0; i < rcv->nch && rcv->state; ) {
         sdr_ch_th_t *th = rcv->th[i];
         int n = th->ch->N / rcv->N;
         int max_lag = th->ch->state == SDR_STATE_SRCH ? MAX_BUFF / 2 : LOCK_LAG;
         int wait = th->park ? 0 : sync ?
-            th->ix + 2 * n <= ix && !srch_lag(th, ix) : ix - th->ix > max_lag;
+            th->ix + 2 * n <= ix && (sync == 2 || !srch_lag(th, ix)) :
+            ix - th->ix > max_lag;
         if (!wait) {
             i++;
             continue;
@@ -1871,7 +1874,9 @@ static void *rcv_thread(void *arg)
         }
         // read raw IF data
         if (!(size = read_data(rcv, raw, nraw))) {
-            if (lockstep) wake_ch_ls(rcv); // let CHs use the last data
+            if (lockstep) { // let CHs use the last data, searching ones too
+                wait_ch_lag(rcv, get_buff_ix(rcv), 2);
+            }
             sdr_sleep_msec(500);
             rcv->state = 0;
             continue;
