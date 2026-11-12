@@ -66,6 +66,7 @@ extern "C" {
 #define SDR_MAX_NCH    1500     // max number of receiver channels
 #define SDR_MAX_NSYM   2000     // max number of symbols
 #define SDR_MAX_NSIG   32       // max number of signals with own search budget
+#define SDR_N_RATE     32       // code rates a channel keeps, one per data second
 #define SDR_MAX_DATA   4096     // max length of navigation data
 #define SDR_N_CORRX    101      // number of additional correlators
 #define SDR_MAX_CORR   (6+SDR_N_CORRX) // max number of correlators
@@ -313,6 +314,9 @@ typedef struct {                // SDR receiver channel type
     sdr_cpx16_t *data;          // data buffer
     sdr_cpx_t *corr;            // correlation buffer
     sdr_mutex_t mtx;            // lock flag
+    double rate_hz[SDR_N_RATE]; // code rate the DLL learned against the
+                                // carrier aid (Hz), per data second
+    int64_t rate_sec[SDR_N_RATE]; // its data second (-1: none)
 } sdr_ch_t;
 
 typedef struct {                // IF data buffer type

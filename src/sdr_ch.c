@@ -47,8 +47,11 @@
 //                   option thres_cn0_l_<sig>
 //  2026-11-12  1.31 DLL gain and bump-jump step by BOC(1,1)'s half chip on
 //                   CBOC/TMBOC codes too (not one of their 12 sub-chips/chip)
+//  2026-11-12  1.32 a new track's DLL starts at the code rate the receiver's
+//                   locked channels on its LO learned (an LO error)
 //
 #include <ctype.h>
+#include <stdlib.h>
 #include <math.h>
 #include "pocket_sdr.h"
 
@@ -81,6 +84,9 @@
 #define BUMP_K     1.3      // bump-jump threshold
 #define ACQ_INT    10       // acquisition interval (ms)
 #define CSK_WIN    280      // L6 CSK correlation window margin (chips)
+#define RATE_LOCK_S 10.0    // lock before a channel's code rate is shared (s)
+#define RATE_CN0   35.0     // C/N0 for a channel's code rate to be shared (dB-Hz)
+#define RATE_LAG_S 3        // age of the code rates a new track starts at (s)
 #define CSK_NFFT   10800    // L6 CSK chip-domain FFT size (>= 10230 + 2 * CSK_WIN)
 
 #define DPI        (2.0 * PI)
@@ -118,6 +124,11 @@ int (*sdr_srch_gpu_run)(const sdr_ch_t *ch, const sdr_buff_t *buff, int ix,
     int M, const float *fds, int len_fds, int k, sdr_srch_res_t *res) = NULL;
 double sdr_e5ab_off = 0.0;  // E5b-E5a group-delay (s)
 double sdr_bump_k = BUMP_K; // bump-jump threshold
+
+// the channels whose code rates a new track starts at -------------------------
+static sdr_ch_t *rate_chs[SDR_MAX_NCH];
+static int n_rate_chs = 0;
+static sdr_mutex_t rate_mtx = SDR_MUTEX_INIT;
 
 // upper cases of signal string ------------------------------------------------
 static void sig_upper(const char *sig, char *Sig)
@@ -491,6 +502,13 @@ sdr_ch_t *sdr_ch_new(const char *sig, int prn, double fs, double fi)
     ch->nav = sdr_nav_new();
     ch->data = (sdr_cpx16_t *)sdr_malloc(sizeof(sdr_cpx16_t) * ch->N);
     sdr_mutex_init(&ch->mtx);
+    for (int i = 0; i < SDR_N_RATE; i++) {
+        ch->rate_hz[i] = 0.0;
+        ch->rate_sec[i] = -1;
+    }
+    sdr_mutex_lock(&rate_mtx);
+    if (n_rate_chs < SDR_MAX_NCH) rate_chs[n_rate_chs++] = ch;
+    sdr_mutex_unlock(&rate_mtx);
     return ch;
 }
 
@@ -506,6 +524,14 @@ sdr_ch_t *sdr_ch_new(const char *sig, int prn, double fs, double fi)
 void sdr_ch_free(sdr_ch_t *ch)
 {
     if (!ch) return;
+    sdr_mutex_lock(&rate_mtx);
+    for (int i = 0; i < n_rate_chs; i++) {
+        if (rate_chs[i] == ch) {
+            rate_chs[i] = rate_chs[--n_rate_chs];
+            break;
+        }
+    }
+    sdr_mutex_unlock(&rate_mtx);
     acq_free(ch->acq);
     trk_free(ch->trk);
     sdr_nav_free(ch->nav);
@@ -576,6 +602,70 @@ static int carry_over_tow(sdr_ch_t *ch, double time, double coff)
     return 1;
 }
 
+//------------------------------------------------------------------------------
+//  The code rate a channel's DLL has learned against its carrier aid, shared
+//  with the receiver's new tracks. An LO error shifts every carrier on that LO
+//  by the same df but not the codes, so each DLL learns df / fc (0.25 chip/s of
+//  BOC(1,1) for the Kraken's +391.8 Hz); a weak track (~30 dB-Hz) loses its
+//  narrow peak before it learns that from zero. Stored as df (Hz): one value
+//  for all signals on an LO, whatever their carrier fc.
+//
+//  A locked channel (RATE_LOCK_S, RATE_CN0) publishes df once a data second in
+//  a ring, the second written last (a seqlock: a reader sees the second, the
+//  value and then the second again unchanged). A new track takes the median
+//  of the values published for the data second RATE_LAG_S before its start,
+//  which every tracking channel has passed in a lock-step replay too, so the
+//  replay stays repeatable.
+//
+static void publish_rate(sdr_ch_t *ch)
+{
+    int64_t sec = (int64_t)floor(ch->time);
+    int slot = (int)(sec % SDR_N_RATE);
+
+    if (sec < 0 || ch->rate_sec[slot] == sec) return;
+    if (ch->lock * ch->T < RATE_LOCK_S || ch->cn0 < RATE_CN0) return;
+    __atomic_store_n(&ch->rate_sec[slot], (int64_t)-1, __ATOMIC_RELEASE);
+    double hz = ch->trk->code_int * ch->fc;
+    __atomic_store(&ch->rate_hz[slot], &hz, __ATOMIC_RELEASE);
+    __atomic_store_n(&ch->rate_sec[slot], sec, __ATOMIC_RELEASE);
+}
+
+static int cmp_double(const void *a, const void *b)
+{
+    double x = *(const double *)a, y = *(const double *)b;
+    return x < y ? -1 : (x > y ? 1 : 0);
+}
+
+// the median code rate (Hz) of the channels on ch's LO at a data second -------
+static int shared_rate(const sdr_ch_t *ch, double time, double *rate)
+{
+    static double vals[SDR_MAX_NCH];
+    static sdr_mutex_t vals_mtx = SDR_MUTEX_INIT;
+    int64_t sec = (int64_t)floor(time) - RATE_LAG_S;
+    int slot = (int)(((sec % SDR_N_RATE) + SDR_N_RATE) % SDR_N_RATE), n = 0;
+    double lo = ch->fc - ch->fi;
+
+    if (sec < 0) return 0;
+    sdr_mutex_lock(&vals_mtx);
+    sdr_mutex_lock(&rate_mtx);
+    for (int i = 0; i < n_rate_chs; i++) {
+        const sdr_ch_t *c = rate_chs[i];
+        if (c == ch || fabs(c->fc - c->fi - lo) > 1.0) continue;
+        int64_t s1 = __atomic_load_n(&c->rate_sec[slot], __ATOMIC_ACQUIRE);
+        double hz;
+        __atomic_load(&c->rate_hz[slot], &hz, __ATOMIC_ACQUIRE);
+        int64_t s2 = __atomic_load_n(&c->rate_sec[slot], __ATOMIC_ACQUIRE);
+        if (s1 == sec && s2 == sec) vals[n++] = hz;
+    }
+    sdr_mutex_unlock(&rate_mtx);
+    if (n > 0) {
+        qsort(vals, n, sizeof(double), cmp_double);
+        *rate = n % 2 ? vals[n / 2] : 0.5 * (vals[n / 2 - 1] + vals[n / 2]);
+    }
+    sdr_mutex_unlock(&vals_mtx);
+    return n;
+}
+
 // start tracking --------------------------------------------------------------
 static void start_track(sdr_ch_t *ch, double time, double fd, double coff,
     double cn0)
@@ -601,6 +691,13 @@ static void start_track(sdr_ch_t *ch, double time, double fd, double coff,
     }
     trk_init(ch->trk);
     sdr_nav_init(ch->nav);
+    double rate;
+    int n = shared_rate(ch, time, &rate);
+    if (n > 0) {
+        ch->trk->code_int = rate / ch->fc;
+        sdr_log(3, "$LOG,%.3f,%s,%d,CODE RATE (%.2f,%d)", time, ch->sig,
+            ch->prn, rate, n);
+    }
 }
 
 //------------------------------------------------------------------------------
@@ -1160,6 +1257,7 @@ static void track_sig(sdr_ch_t *ch, double time, const sdr_buff_t *buff, int ix)
         ch->trk->coh_n = 0;
     }
     DLL(ch);
+    publish_rate(ch);
     int cn0_upd = CN0(ch, IPs, QPs, pli_upd);
     
     // decode navigation data
