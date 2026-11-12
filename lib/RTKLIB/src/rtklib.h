@@ -30,6 +30,7 @@
 *
 *           branch for Pocket SDR
 *           2026/06/01 0.1  add almanac decoder functions
+*           2026/11/12 0.2  add api decode_bds_bcnav1()
 *-----------------------------------------------------------------------------*/
 #ifndef RTKLIB_H
 #define RTKLIB_H
@@ -1578,6 +1579,7 @@ EXPORT int decode_bds_d1(const uint8_t *buff, eph_t *eph, alm_t *alm,
                          double *ion, double *utc);
 EXPORT int decode_bds_d2(const uint8_t *buff, eph_t *eph, alm_t *alm,
                          double *utc);
+EXPORT int decode_bds_bcnav1(const uint8_t *buff, eph_t *eph);
 EXPORT int decode_gal_inav(const uint8_t *buff, eph_t *eph, alm_t *alm,
                            double *ion, double *utc);
 EXPORT int decode_gal_fnav(const uint8_t *buff, eph_t *eph, alm_t *alm,

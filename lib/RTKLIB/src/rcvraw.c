@@ -19,6 +19,8 @@
 *     [6] ISRO-IRNSS-ICD-SPS-1.1, Indian Regional Navigation Satellite System
 *         Signal in Space ICD for Standard Positioning Service version 1.1,
 *         August, 2017
+*     [7] BeiDou Navigation Satellite System Signal In Space Interface Control
+*         Document Open Service Signal B1C (Version 1.0), December, 2017
 *
 * version : $Revision:$ $Date:$
 * history : 2009/04/10 1.0  new
@@ -53,6 +55,7 @@
 *           2024/04/03 0.1  delete receiver dependent functions
 *           2025/03/05 0.2  support binex, novatel, ublox, septentrio
 *           2026/06/01 0.3  add almanac decoder functions for GLO,GAL,BDS
+*           2026/11/12 0.4  add api decode_bds_bcnav1() for BDS-3 B-CNAV1
 *-----------------------------------------------------------------------------*/
 #include "rtklib.h"
 
@@ -1097,6 +1100,96 @@ extern int decode_bds_d2(const uint8_t *buff, eph_t *eph, alm_t *alm,
     if (eph&&!decode_bds_d2_eph(buff,eph)) return 0;
     if (alm&&!decode_bds_d2_alm(buff,alm)) return 0;
     if (utc&&!decode_bds_d2_utc(buff,utc)) return 0;
+    return 1;
+}
+/* 33-bit fields of a B-CNAV1 frame ------------------------------------------*/
+static double getbits_33(const uint8_t *buff, int pos)
+{
+    return getbits(buff,pos,1)*4294967296.0+getbitu(buff,pos+1,32);
+}
+static double getbitu_33(const uint8_t *buff, int pos)
+{
+    return getbitu(buff,pos,1)*4294967296.0+getbitu(buff,pos+1,32);
+}
+/* decode BDS B-CNAV1 ephemeris ------------------------------------------------
+* decode BDS-3 B1C B-CNAV1 ephemeris and clock (ref [7] 6.2.3, 7.2, 7.3)
+* args   : uint8_t *buff    I   B-CNAV1 frame data (LDPC decoded, CRC checked)
+*                                 bits   0- 13: subframe 1 (PRN, SOH)
+*                                 bits  14-613: subframe 2 (600 bits)
+*                                 bits 614-877: subframe 3 (264 bits)
+*          eph_t    *eph    O   BDS ephemeris (CNAV type: eph->A is A0, the
+*                                 semi-major axis at toe, with its rate
+*                                 eph->Adot; eph->deln is delta n0 at toe,
+*                                 with its rate eph->ndot; eph2pos() uses
+*                                 both rates)
+* return : status (1:ok,0:error)
+* notes  : the satellite health (subframe 3) is not decoded: eph->svh=0
+*-----------------------------------------------------------------------------*/
+extern int decode_bds_bcnav1(const uint8_t *buff, eph_t *eph)
+{
+    const double ref_axis_meo=27906100.0;  /* Aref MEO (m) (ref [7] 7.2) */
+    const double ref_axis_igso=42162200.0; /* Aref IGSO/GEO (m) */
+    eph_t eph_bds={0};
+    double frame_sow,toc_bds,ref_axis;
+    int i,sat_type;
+    
+    trace(4,"decode_bds_bcnav1:\n");
+    
+    /* subframe 1: the frame's start in BDT (hours of week from subframe 2 and
+       seconds of hour as SOH x 18 s) */
+    i=14; /* subframe 2 */
+    eph_bds.week  =getbitu(buff,i,13);         i+=13; /* WN (BDT) */
+    frame_sow     =getbitu(buff,i, 8)*3600.0+getbitu(buff,6,8)*18.0; i+=8;
+    eph_bds.iodc  =getbitu(buff,i,10);         i+=10;
+    eph_bds.iode  =getbitu(buff,i, 8);         i+=8;
+    
+    /* ephemeris I: toe, orbit type, the semi-major axis and mean motion with
+       their rates, M0, e, omega */
+    eph_bds.toes  =getbitu(buff,i,11)*300.0;   i+=11;
+    sat_type      =getbitu(buff,i, 2);         i+=2;  /* 1:GEO,2:IGSO,3:MEO */
+    ref_axis      =sat_type==3?ref_axis_meo:ref_axis_igso;
+    eph_bds.A     =ref_axis+getbits(buff,i,26)*P2_9; i+=26;
+    eph_bds.Adot  =getbits(buff,i,25)*P2_21;   i+=25;
+    eph_bds.deln  =getbits(buff,i,17)*ldexp(1.0,-44)*SC2RAD; i+=17;
+    eph_bds.ndot  =getbits(buff,i,23)*ldexp(1.0,-57)*SC2RAD; i+=23;
+    eph_bds.M0    =getbits_33(buff,i)*P2_32*SC2RAD; i+=33;
+    eph_bds.e     =getbitu_33(buff,i)*P2_34;   i+=33;
+    eph_bds.omg   =getbits_33(buff,i)*P2_32*SC2RAD; i+=33;
+    
+    /* ephemeris II: the orbit plane, its rates and the harmonic corrections */
+    eph_bds.OMG0  =getbits_33(buff,i)*P2_32*SC2RAD; i+=33;
+    eph_bds.i0    =getbits_33(buff,i)*P2_32*SC2RAD; i+=33;
+    eph_bds.OMGd  =getbits(buff,i,19)*ldexp(1.0,-44)*SC2RAD; i+=19;
+    eph_bds.idot  =getbits(buff,i,15)*ldexp(1.0,-44)*SC2RAD; i+=15;
+    eph_bds.cis   =getbits(buff,i,16)*P2_30;   i+=16;
+    eph_bds.cic   =getbits(buff,i,16)*P2_30;   i+=16;
+    eph_bds.crs   =getbits(buff,i,24)*P2_8;    i+=24;
+    eph_bds.crc   =getbits(buff,i,24)*P2_8;    i+=24;
+    eph_bds.cus   =getbits(buff,i,21)*P2_30;   i+=21;
+    eph_bds.cuc   =getbits(buff,i,21)*P2_30;   i+=21;
+    
+    /* clock (referenced to B3I) and the group delays of B2ap, B1Cd and B1Cp */
+    toc_bds       =getbitu(buff,i,11)*300.0;   i+=11;
+    eph_bds.f0    =getbits(buff,i,25)*P2_34;   i+=25;
+    eph_bds.f1    =getbits(buff,i,22)*P2_50;   i+=22;
+    eph_bds.f2    =getbits(buff,i,11)*P2_66;   i+=11;
+    eph_bds.tgd[3]=getbits(buff,i,12)*P2_34;   i+=12; /* TGD_B2ap */
+    eph_bds.tgd[4]=getbits(buff,i,12)*P2_34;   i+=12; /* ISC_B1Cd */
+    eph_bds.tgd[2]=getbits(buff,i,12)*P2_34;   i+=12; /* TGD_B1Cp */
+    
+    if (sat_type==0||eph_bds.A<=0.0) {
+        trace(3,"decode_bds_bcnav1 error: sat_type=%d\n",sat_type);
+        return 0;
+    }
+    /* times in GPST, toe and toc in the week nearest the frame's */
+    eph_bds.ttr=bdt2gpst(bdt2time(eph_bds.week,frame_sow));
+    if      (eph_bds.toes>frame_sow+302400.0) eph_bds.week--;
+    else if (eph_bds.toes<frame_sow-302400.0) eph_bds.week++;
+    eph_bds.toe=bdt2gpst(bdt2time(eph_bds.week,eph_bds.toes));
+    eph_bds.toc=bdt2gpst(bdt2time(eph_bds.week,toc_bds));
+    eph_bds.code=0; /* data source = unknown */
+    eph_bds.flag=sat_type==1?2:1; /* nav type = IGSO/MEO or GEO */
+    *eph=eph_bds;
     return 1;
 }
 /* test hamming code of GLONASS navigation string ------------------------------

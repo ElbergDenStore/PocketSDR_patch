@@ -20,6 +20,7 @@
 //                   inherit the last fix position regardless of the CPU time
 //  2026-11-11  1.6  add the PVT's C/N0 mask and C/N0 weighting (options
 //                   cn0_mask, cn0_weight)
+//  2026-11-12  1.7  add BDS-3 B-CNAV1 ephemeris from B1CD
 //
 #include "pocket_sdr.h"
 
@@ -1084,6 +1085,15 @@ void sdr_pvt_udnav(sdr_pvt_t *pvt, sdr_ch_t *ch)
                 decode_bds_d2(data, NULL, pvt->nav->alm, NULL)) {
                 out_log_alm_sys(ch->time, ch->sig, pvt->nav, SYS_CMP);
             }
+        }
+    } else if (!strcmp(ch->sig, "B1CD")) { // BDS-3 B-CNAV1
+        // every frame (LDPC decoded, CRC checked) carries the whole ephemeris
+        // in subframe 2
+        if (decode_bds_bcnav1(data, pvt->nav->eph + sat - 1)) {
+            pvt->nav->eph[sat-1].sat = sat;
+            out_log_eph(ch->time, ch->sat, ch->sig, pvt->nav->eph + sat - 1);
+            out_rtcm3_nav(pvt->rtcm, sat, 0, pvt->nav, pvt->rcv);
+            pvt->count[2]++;
         }
     } else if (!strcmp(ch->sig, "I5S") || !strcmp(ch->sig, "ISS")) { // NavIC NAV
         if (ch->nav->type == 2 &&

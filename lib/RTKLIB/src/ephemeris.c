@@ -73,6 +73,8 @@
 *
 *           branch for Pocket SDR
 *           2026/06/01 0.1  add api galm2pos() for glonass almanac
+*           2026/11/12 0.2  apply the CNAV rates of the semi-major axis and
+*                           the mean motion (eph->Adot, eph->ndot) in eph2pos()
 *-----------------------------------------------------------------------------*/
 #include "rtklib.h"
 
@@ -273,7 +275,7 @@ extern double eph2clk(gtime_t time, const eph_t *eph)
 extern void eph2pos(gtime_t time, const eph_t *eph, double *rs, double *dts,
                     double *var)
 {
-    double tk,M,E,Ek,sinE,cosE,u,r,i,O,sin2u,cos2u,x,y,sinO,cosO,cosi,mu,omge;
+    double tk,A,M,E,Ek,sinE,cosE,u,r,i,O,sin2u,cos2u,x,y,sinO,cosO,cosi,mu,omge;
     double xg,yg,zg,sino,coso;
     int n,sys,prn;
     
@@ -290,7 +292,10 @@ extern void eph2pos(gtime_t time, const eph_t *eph, double *rs, double *dts,
         case SYS_CMP: mu=MU_CMP; omge=OMGE_CMP; break;
         default:      mu=MU_GPS; omge=OMGE;     break;
     }
-    M=eph->M0+(sqrt(mu/(eph->A*eph->A*eph->A))+eph->deln)*tk;
+    /* semi-major axis and mean motion at time: a CNAV ephemeris (BDS B-CNAV1)
+       gives their rates, the others give 0 (BDS-SIS-ICD-B1C 1.0 7.2) */
+    A=eph->A+eph->Adot*tk;
+    M=eph->M0+(sqrt(mu/(eph->A*eph->A*eph->A))+eph->deln+0.5*eph->ndot*tk)*tk;
     
     for (n=0,E=M,Ek=0.0;fabs(E-Ek)>RTOL_KEPLER&&n<MAX_ITER_KEPLER;n++) {
         Ek=E; E-=(E-eph->e*sin(E)-M)/(1.0-eph->e*cos(E));
@@ -304,7 +309,7 @@ extern void eph2pos(gtime_t time, const eph_t *eph, double *rs, double *dts,
     trace(4,"kepler: sat=%2d e=%8.5f n=%2d del=%10.3e\n",eph->sat,eph->e,n,E-Ek);
     
     u=atan2(sqrt(1.0-eph->e*eph->e)*sinE,cosE-eph->e)+eph->omg;
-    r=eph->A*(1.0-eph->e*cosE);
+    r=A*(1.0-eph->e*cosE);
     i=eph->i0+eph->idot*tk;
     sin2u=sin(2.0*u); cos2u=cos(2.0*u);
     u+=eph->cus*sin2u+eph->cuc*cos2u;
@@ -335,7 +340,7 @@ extern void eph2pos(gtime_t time, const eph_t *eph, double *rs, double *dts,
     *dts=eph->f0+eph->f1*tk+eph->f2*tk*tk;
     
     /* relativity correction */
-    *dts-=2.0*sqrt(mu*eph->A)*eph->e*sinE/SQR(CLIGHT);
+    *dts-=2.0*sqrt(mu*A)*eph->e*sinE/SQR(CLIGHT);
     
     /* position and clock error variance */
     *var=var_uraeph(sys,eph->sva);
