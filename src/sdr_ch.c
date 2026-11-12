@@ -45,6 +45,8 @@
 //  2026-10-30  1.29 searches on GPU hooks (option srch_gpu)
 //  2026-11-11  1.30 searches follow the code's drift (sdr_search_code_drift),
 //                   option thres_cn0_l_<sig>
+//  2026-11-12  1.31 DLL gain and bump-jump step by BOC(1,1)'s half chip on
+//                   CBOC/TMBOC codes too (not one of their 12 sub-chips/chip)
 //
 #include <ctype.h>
 #include <math.h>
@@ -854,6 +856,13 @@ static void PLL(sdr_ch_t *ch, double IP, double QP, double dt, int costas)
     }
 }
 
+// code sub-chip (s): BOC(1,1)'s half chip for 12 sub-chips/chip CBOC/TMBOC ----
+static double sub_chip(const sdr_ch_t *ch)
+{
+    int n = sdr_code_len(ch->sig);
+    return ch->len_code == 12 * n ? ch->T / n / 2 : ch->T / ch->len_code;
+}
+
 // DLL (2nd-order, zeta=0.707, Bn=W/0.53) --------------------------------------
 static void DLL(sdr_ch_t *ch)
 {
@@ -867,7 +876,7 @@ static void DLL(sdr_ch_t *ch)
         double E = sqrt(ch->trk->sumC[1]);
         double L = sqrt(ch->trk->sumC[2]);
         if (E + L > 0.0) {
-            double err_code = (E - L) / (E + L) * 0.5f * ch->T / ch->len_code;
+            double err_code = (E - L) / (E + L) * 0.5f * sub_chip(ch);
             double W = sdr_b_dll / 0.53;
             double dt = ch->T * N;
             ch->trk->code_int += W * W * err_code * dt;
@@ -893,7 +902,7 @@ static void bump_jump(sdr_ch_t *ch)
     } else if (!strcmp(ch->sig, "G1OCP") || !strcmp(ch->sig, "G2OCP")) {
         step = ch->T / ch->len_code / 2;
     } else {
-        step = ch->T / ch->len_code;
+        step = sub_chip(ch);
     }
     if (ch->trk->sumVL > sdr_bump_k * ch->trk->sumP &&
         ch->trk->sumP > sdr_bump_k * ch->trk->sumVE) {
