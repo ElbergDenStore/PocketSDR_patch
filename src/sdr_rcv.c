@@ -44,6 +44,8 @@
 //                   fast slot with known-Doppler searches only; lock-step
 //                   starts its budget's searches in the normal slot
 //  2026-11-11  1.19 add options cn0_mask and cn0_weight (PVT)
+//  2026-11-13  1.20 real time keeps srch_budget too: the credits refill every
+//                   cycle and a search starts on credit and an idle CH
 //
 #include "pocket_sdr.h"
 #ifndef WIN32
@@ -87,10 +89,10 @@ static int lockstep = 0;        // lock-step file replay (-tscale 0): no data sk
 
 // global variables ------------------------------------------------------------
 double sdr_max_acq = MAX_ACQ;
-double sdr_srch_budget = 0.0;   // lock-step search budget (CPU s per s of data, 0:off)
+double sdr_srch_budget = 0.0;   // search budget (CPU s per s of data, 0:off)
 double sdr_srch_budget_cold = 0.0; // the same until srch_nsat are locked (0:srch_budget)
 int sdr_srch_nsat = 5;          // satellites locked for srch_budget instead of the cold one
-double sdr_srch_budget_gpu = 0.5; // lock-step GPU search budget (GPU s per s of data)
+double sdr_srch_budget_gpu = 0.5; // GPU search budget (GPU s per s of data)
 static struct {                 // the host's CPU (GPU) ns per nominal flop of a
     char sig[16];               // signal's search (options srch_ns_<sig>,
     double ns, gpu_ns;          // srch_gpu_ns_<sig>; default 1)
@@ -1587,10 +1589,10 @@ static int srch_slot_busy(sdr_rcv_t *rcv, int slot)
     return ch->state == SDR_STATE_SRCH && ch->srch_slot == slot;
 }
 
-// start signal search on CH i in a slot (lock-step budget: spend its cost) ---
+// start signal search on CH i in a slot (budget: spend its cost) -----------
 static int start_srch(sdr_rcv_t *rcv, int i, int64_t ix, int slot)
 {
-    if (lockstep && sdr_srch_budget > 0.0) {
+    if (sdr_srch_budget > 0.0) {
         rcv->srch_credit[rcv->th[i]->isig] -= srch_cost(rcv->th[i]->ch);
     }
     rcv->ich[slot] = i;
@@ -1654,9 +1656,25 @@ static int start_srch_ch(sdr_rcv_t *rcv, int64_t ix, int isig, int slot)
     return 0;
 }
 
-// update signal search channels: one search in each free slot ---------------
+static int refill_srch_credit(sdr_rcv_t *rcv, int64_t ix, int ncyc);
+static void spend_srch_credit(sdr_rcv_t *rcv, int64_t ix);
+static int nsat_lock(sdr_rcv_t *rcv, int64_t ix);
+
+// update signal search channels in real time: with a budget, its credits
+// refilled every cycle, a search starts on credit and an idle CH (the locks
+// counted every lock-step slot's time); without, one search in each free slot
 static void update_srch_ch(sdr_rcv_t *rcv)
 {
+    int64_t ix = get_buff_ix(rcv);
+    
+    if (sdr_srch_budget > 0.0) {
+        if (ix % SRCH_CYC_LS == 0) rcv->nsat_lock = nsat_lock(rcv, ix);
+        if (refill_srch_credit(rcv, ix, 1) &&
+            rcv->stats.buff_use <= MAX_BUFF_USE) {
+            spend_srch_credit(rcv, ix);
+        }
+        return;
+    }
     if (rcv->stats.buff_use > MAX_BUFF_USE) { // IF data buffer full ?
         return;
     }
@@ -1744,7 +1762,7 @@ static int nsat_lock(sdr_rcv_t *rcv, int64_t ix)
     return n;
 }
 
-// lock-step search budget (cores): the cold one until srch_nsat satellites
+// search budget (cores): the cold one until srch_nsat satellites
 // were locked at the last sync, and again when locks drop (an interferer) --------
 static double srch_budget(sdr_rcv_t *rcv, int64_t ix)
 {
@@ -1758,17 +1776,45 @@ static double srch_budget(sdr_rcv_t *rcv, int64_t ix)
     return cold ? sdr_srch_budget_cold : sdr_srch_budget;
 }
 
-// lock-step: start search on synced CHs, so data alone decides it. With a
-// budget, each signal has its own round robin and credit: starts spend their
-// CPU cost until the credit is gone, and the credits refill by equal shares of
-// the budget among the signals searched or in debt at the last slot, so a
-// cheap signal comes round sooner; the signals searched on the GPU share the
-// GPU budget instead. The locks are counted on the synced CHs, so they too
-// depend on the data only -------------------------------------------------
-static void update_srch_ch_ls(sdr_rcv_t *rcv, int64_t ix)
+// search budget: each signal has its own round robin and credit: starts
+// spend their CPU cost until the credit is gone, and the credits refill, for
+// ncyc cycles, by equal shares of the budget among the signals searched or in
+// debt at the last refill, so a cheap signal comes round sooner; the signals
+// searched on the GPU share the GPU budget instead. A credit holds at most one
+// refill: return 1 if any signal has credit -------------------------------
+static int refill_srch_credit(sdr_rcv_t *rcv, int64_t ix, int ncyc)
 {
     int nact[2] = {0}, credit = 0;
+    double slot[2] = {srch_budget(rcv, ix), sdr_srch_budget_gpu};
     
+    for (int i = 0; i < rcv->nsig; i++) nact[rcv->srch_gpu[i]] += rcv->srch_act[i];
+    for (int i = 0; i < rcv->nsig; i++) {
+        int g = rcv->srch_gpu[i];
+        int64_t share = (int64_t)(slot[g] * 1e6 * ncyc * SDR_CYC /
+            (nact[g] > 0 ? nact[g] : 1));
+        rcv->srch_credit[i] = MIN(rcv->srch_credit[i] + share, share);
+        credit |= rcv->srch_credit[i] > 0;
+    }
+    return credit;
+}
+
+// search budget: each signal with credit starts searches on its idle CHs until
+// the credit is spent; a signal with credit left and none started is out of
+// the next refill's shares ------------------------------------------------
+static void spend_srch_credit(sdr_rcv_t *rcv, int64_t ix)
+{
+    for (int i = 0; i < rcv->nsig; i++) {
+        int started = 0;
+        while (rcv->srch_credit[i] > 0 && start_srch_ch(rcv, ix, i, SDR_SRCH_NORM)) started++;
+        rcv->srch_act[i] = rcv->srch_credit[i] <= 0 || started;
+    }
+}
+
+// lock-step: start search on synced CHs every slot, so data alone decides it,
+// with a budget its credits refilled by the slot. The locks are counted on the
+// synced CHs, so they too depend on the data only -------------------------
+static void update_srch_ch_ls(sdr_rcv_t *rcv, int64_t ix)
+{
     if (ix % SRCH_CYC_LS) return;
     if (sdr_srch_budget <= 0.0) {
         wait_ch_lag(rcv, ix, 1);
@@ -1776,23 +1822,10 @@ static void update_srch_ch_ls(sdr_rcv_t *rcv, int64_t ix)
         start_srch_ch(rcv, ix, -1, SDR_SRCH_NORM);
         return;
     }
-    double slot[2] = {srch_budget(rcv, ix), sdr_srch_budget_gpu};
-    for (int i = 0; i < rcv->nsig; i++) nact[rcv->srch_gpu[i]] += rcv->srch_act[i];
-    for (int i = 0; i < rcv->nsig; i++) {
-        int g = rcv->srch_gpu[i];
-        int64_t share = (int64_t)(slot[g] * 1e6 * SRCH_CYC_LS * SDR_CYC /
-            (nact[g] > 0 ? nact[g] : 1));
-        rcv->srch_credit[i] = MIN(rcv->srch_credit[i] + share, share);
-        credit |= rcv->srch_credit[i] > 0;
-    }
-    if (!credit) return;
+    if (!refill_srch_credit(rcv, ix, SRCH_CYC_LS)) return;
     wait_ch_lag(rcv, ix, 1);
     rcv->nsat_lock = nsat_lock(rcv, ix);
-    for (int i = 0; i < rcv->nsig; i++) {
-        int started = 0;
-        while (rcv->srch_credit[i] > 0 && start_srch_ch(rcv, ix, i, SDR_SRCH_NORM)) started++;
-        rcv->srch_act[i] = rcv->srch_credit[i] <= 0 || started;
-    }
+    spend_srch_credit(rcv, ix);
 }
 
 // output sensor log -----------------------------------------------------------

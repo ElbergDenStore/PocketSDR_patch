@@ -466,13 +466,13 @@ typedef struct sdr_rcv_tag {    // SDR receiver type
     double tscale;              // time scale to replay IF data file
     char opt[1024];             // receiver options
     int fast_acq;               // fast acquisition flag (0:off, 1:on)
-    int nsig;                   // number of signals (lock-step search budget)
-    int64_t srch_credit[SDR_MAX_NSIG]; // lock-step search budget credit per signal (CPU us)
-    int srch_rr[SDR_MAX_NSIG];  // lock-step: last search without Doppler per signal
-    int srch_act[SDR_MAX_NSIG]; // lock-step: signal searched or in debt at the last slot
-    int srch_gpu[SDR_MAX_NSIG]; // lock-step: signal's searches on the GPU budget
-    int nsat_lock;              // lock-step: satellites locked at the last search sync
-    int srch_cold;              // lock-step: the cold search budget applies
+    int nsig;                   // number of signals (search budget)
+    int64_t srch_credit[SDR_MAX_NSIG]; // search budget credit per signal (CPU us)
+    int srch_rr[SDR_MAX_NSIG];  // last search without Doppler per signal
+    int srch_act[SDR_MAX_NSIG]; // signal searched or in debt at the last refill
+    int srch_gpu[SDR_MAX_NSIG]; // signal's searches on the GPU budget
+    int nsat_lock;              // satellites locked at the last count (lock-step: search sync)
+    int srch_cold;              // the cold search budget applies
     sdr_thread_t thread;        // SDR receiver thread
     sdr_mutex_t mtx;            // lock flag
     sdr_cond_t data_cond;       // lock-step: new IF data (with mtx)
